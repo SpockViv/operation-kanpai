@@ -1,333 +1,276 @@
 #!/usr/bin/env python3
 """
-Polymarket BTC Up/Down collector (1-second snapshots, beginner-friendly).
+Polymarket BTC Up/Down 15-minute orderbook collector (self updating).
 
-Records every ~1 second:
-- token0 + token1:
-  - best ask price, best bid price
-  - best ask size, best bid size  (from /book)
-  - mid, spread, top-of-book notional (price * size)
-- BTC spot reference price (Binance):
-  - btc_price, btc_source, btc_payload_ts_ms
-
-Output:
-- data/raw/<slug>_snapshots.csv
-
-Run (PowerShell, from project root):
-  python src/collector_polymarket.py --event-url "https://polymarket.com/event/<slug>" --seconds 60 --interval 1
+- Paste ONE starting EVENT_SLUG (e.g. "btc-updown-15m-1766907900")
+- Script automatically rolls to the next slug every 15 minutes (+900s)
+- For each 15-minute event:
+  - looks up YES/NO token IDs via Gamma
+  - subscribes to Polymarket CLOB market websocket
+  - writes 1-second snapshots to: <slug>_depth.csv (yes_bid, yes_ask, yes_bid_depth, yes_ask_depth, no_bid, no_ask, no_bid_depth, no_ask_depth)
 """
 
-from __future__ import annotations
-
-import argparse
+import asyncio
 import csv
 import json
-import os
-import re
 import time
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
 
 import requests
+import websockets
+
+try:
+    from zoneinfo import ZoneInfo
+    NY_TZ = ZoneInfo("America/New_York")
+except Exception:
+    NY_TZ = None  # fallback below
 
 
-# -----------------------
-# Endpoints
-# -----------------------
-GAMMA_BASE = "https://gamma-api.polymarket.com"
-CLOB_BASE = "https://clob.polymarket.com"
-BINANCE_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
+# ======================
+# CONFIG (only change EVENT_SLUG)
+# ======================
+EVENT_SLUG = "btc-updown-15m-1766941200"
+DEPTH_LEVELS = 10
+SNAPSHOT_INTERVAL_SECONDS = 1.0
+
+GAMMA_API = "https://gamma-api.polymarket.com"
+WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 
-# -----------------------
-# Helpers: paths
-# -----------------------
-def project_root() -> Path:
-    # assumes this file is <root>/src/collector_polymarket.py
-    return Path(__file__).resolve().parents[1]
-
-
-# -----------------------
-# Utilities: parsing
-# -----------------------
-def event_slug_from_url(url: str) -> str:
-    m = re.search(r"/event/([^/?#]+)", url)
-    if not m:
-        raise ValueError(f"Could not extract slug from URL: {url}")
-    return m.group(1)
-
-
-def sanitize_token_id(token_id: Any) -> str:
-    s = str(token_id).strip().strip('"').strip("'")
-    s_digits = re.sub(r"[^\d]", "", s)
-    if not s_digits:
-        raise ValueError(f"Token id did not contain digits: {token_id}")
-    return s_digits
-
-
-def parse_token_id_list(maybe_list: Any) -> List[str]:
+# ======================
+# TIME + SLUG HELPERS
+# ======================
+def split_slug(slug: str):
     """
-    Accepts either:
-      - a real list: ["123","456"]
-      - a JSON string: '["123","456"]'
-      - a single token as string/int
-    Returns a list of digit-only token ids.
+    "btc-updown-15m-1766907900" -> ("btc-updown-15m", 1766907900)
     """
-    if isinstance(maybe_list, list):
-        raw = maybe_list
-    elif isinstance(maybe_list, str):
-        s = maybe_list.strip()
-        if s.startswith("[") and s.endswith("]"):
-            raw = json.loads(s)
-        else:
-            raw = [s]
+    prefix, ts_str = slug.rsplit("-", 1)
+    return prefix, int(ts_str)
+
+
+def slug_for_timestamp(prefix: str, ts: int) -> str:
+    return f"{prefix}-{ts}"
+
+
+def next_15m_timestamp(ts: int) -> int:  ##  adds 900 seconds to timestamp
+    return ts + 900
+
+
+def now_ny_iso() -> str:
+    if NY_TZ is not None:
+        return datetime.now(NY_TZ).isoformat()
+    # fallback: UTC iso
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+# ======================
+# GAMMA HELPERS
+# ======================
+def fetch_event_by_slug(slug: str) -> dict:
+    r = requests.get(f"{GAMMA_API}/events/slug/{slug}", timeout=15)
+    r.raise_for_status()
+    return r.json()  ##  converts JSON response into Python dict
+'''
+What this returns
+{
+  "id": 126418,
+  "slug": "btc-updown-15m-1766907900",
+  "title": "Bitcoin Up or Down - December 28, 2:00AM-2:15AM ET",
+  "markets": [
+      {
+        "clobTokenIds": ["7773...", "11036..."],
+        ...
+      }
+  ],
+  ...
+}
+'''
+
+def parse_clob_token_ids(val):
+    if val is None:
+        return []
+    if isinstance(val, list):  ##  class stuff. Hopefully you understand.
+        return [str(x) for x in val]
+    if isinstance(val, str):
+        return [str(x) for x in json.loads(val)]
+    return []
+
+
+def extract_yes_no_tokens(event: dict) -> tuple[str, str]:
+    markets = event.get("markets", [])
+    if not markets:
+        raise ValueError("No markets in event")
+
+    for m in markets:
+        if "clobTokenIds" in m:
+            ids = parse_clob_token_ids(m["clobTokenIds"])
+            if len(ids) >= 2:
+                return ids[0], ids[1]
+
+    raise ValueError("Could not find YES/NO token IDs")
+
+
+# ======================
+# ORDERBOOK HELPERS
+# ======================
+def parse_level(lvl):
+    if isinstance(lvl, dict):
+        p = lvl.get("price") or lvl.get("p")
+        s = lvl.get("size") or lvl.get("s")
+    elif isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
+        p, s = lvl[0], lvl[1]
     else:
-        raw = [maybe_list]
-
-    return [sanitize_token_id(x) for x in raw]
-
-
-# -----------------------
-# Gamma: fetch event JSON
-# -----------------------
-def fetch_event_by_slug(slug: str, timeout: float = 15.0) -> Dict[str, Any]:
-    url = f"{GAMMA_BASE}/events/slug/{slug}"
-    r = requests.get(url, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
-
-
-def extract_clob_token_ids_from_event(event_json: Dict[str, Any]) -> List[str]:
-    markets = event_json.get("markets")
-    if not isinstance(markets, list) or not markets:
-        raise ValueError("Event JSON missing 'markets' list or it's empty.")
-
-    candidate_keys = ("clobTokenIds", "clob_token_ids", "tokenIds", "token_ids")
-    for market in markets:
-        for key in candidate_keys:
-            if key in market:
-                token_ids = parse_token_id_list(market[key])
-                if len(token_ids) >= 2:
-                    return token_ids[:2]
-
-    raise ValueError("Could not find CLOB token IDs in event JSON.")
-
-
-# -----------------------
-# CLOB: /book parsing
-# -----------------------
-def _parse_level(level: Any) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Polymarket /book formats vary. This safely parses:
-      - {"price":"0.51","size":"10"}
-      - ["0.51","10"]
-      - {"p":"0.51","s":"10"}  (just in case)
-    Returns (price, size) floats or (None, None).
-    """
-    if isinstance(level, dict):
-        p = level.get("price", level.get("p"))
-        s = level.get("size", level.get("s"))
-        try:
-            return (float(p) if p is not None else None,
-                    float(s) if s is not None else None)
-        except Exception:
-            return (None, None)
-
-    if isinstance(level, (list, tuple)) and len(level) >= 2:
-        try:
-            return float(level[0]), float(level[1])
-        except Exception:
-            return (None, None)
-
-    return (None, None)
-
-
-def get_book_top(
-    session: requests.Session,
-    token_id: str,
-    timeout: float = 5.0,
-) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
-    """
-    GET /book?token_id=...
-    Returns:
-      best_ask_price, best_ask_size, best_bid_price, best_bid_size
-    """
-    token_id = sanitize_token_id(token_id)
-    url = f"{CLOB_BASE}/book"
-    r = session.get(url, params={"token_id": token_id}, timeout=timeout)
-    r.raise_for_status()
-    book = r.json()
-
-    asks = book.get("asks") or []
-    bids = book.get("bids") or []
-
-    best_ask_p = best_ask_s = None
-    best_bid_p = best_bid_s = None
-
-    if isinstance(asks, list) and asks:
-        best_ask_p, best_ask_s = _parse_level(asks[0])
-
-    if isinstance(bids, list) and bids:
-        best_bid_p, best_bid_s = _parse_level(bids[0])
-
-    return best_ask_p, best_ask_s, best_bid_p, best_bid_s
-
-
-# -----------------------
-# BTC: Binance spot price
-# -----------------------
-def get_btc_price_binance(session: requests.Session, timeout: float = 3.0) -> Tuple[Optional[float], str, Optional[int]]:
-    """
-    Returns (btc_price, source, payload_ts_ms).
-    Binance endpoint doesn't always include a timestamp, so payload_ts_ms is None.
-    """
-    try:
-        r = session.get(BINANCE_PRICE_URL, params={"symbol": "BTCUSDT"}, timeout=timeout)
-        r.raise_for_status()
-        data = r.json()
-        price = float(data["price"])
-        return price, "binance_spot", None
-    except Exception:
-        return None, "binance_spot", None
-
-
-# -----------------------
-# Collector
-# -----------------------
-def iso_now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time()))
-
-
-def mid_and_spread(a: Optional[float], b: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
-    if a is None or b is None:
         return None, None
-    return (a + b) / 2.0, (a - b)
+
+    try:
+        return float(p), float(s)
+    except Exception:
+        return None, None
 
 
-def notional(p: Optional[float], s: Optional[float]) -> Optional[float]:
-    if p is None or s is None:
-        return None
-    return p * s
+def normalize_levels(levels, side: str):
+    """
+    side: "bids" -> sort desc (highest first)
+          "asks" -> sort asc  (lowest first)
+    """
+    out = []
+    for lvl in levels or []:
+        p, s = parse_level(lvl)
+        if p is not None and s is not None:
+            out.append((p, s))
+
+    out.sort(key=lambda x: x[0], reverse=(side == "bids"))
+    return out
 
 
-def collect_every_second(
-    event_slug: str,
-    seconds: int = 60,
-    interval: float = 1.0,
-    out_dir: str = "data/raw",
-) -> Path:
-    root = project_root()
-    out_path = (root / out_dir).resolve()
-    out_path.mkdir(parents=True, exist_ok=True)
+def best_price(levels):
+    return levels[0][0] if levels else None
 
-    # Fetch event + tokens
-    event_json = fetch_event_by_slug(event_slug)
-    token0, token1 = extract_clob_token_ids_from_event(event_json)
-    token0 = sanitize_token_id(token0)
-    token1 = sanitize_token_id(token1)
 
-    print(f"Event slug: {event_slug}")
-    print(f"Token0: {token0}")
-    print(f"Token1: {token1}")
+def depth_sum(levels):
+    return sum(s for _, s in levels)
 
-    out_file = out_path / f"{event_slug}_snapshots.csv"
 
-    session = requests.Session()
+# ======================
+# COLLECT ONE EVENT (15 minutes)
+# ======================
+async def collect_one_event(slug: str, end_unix_ts: int):
+    event = fetch_event_by_slug(slug)
+    yes_token, no_token = extract_yes_no_tokens(event)
 
-    start_mono = time.monotonic()
-    end_mono = start_mono + float(seconds)
-    next_tick = start_mono
+    print(f"\nEvent title: {event.get('title')}")
+    print(f"Event slug:  {slug}")
+    print(f"YES token:   {yes_token}")
+    print(f"NO token:    {no_token}")
 
-    with out_file.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([
-            "unix_ts", "iso_time", "event_slug",
-            "btc_price", "btc_source", "btc_payload_ts_ms",
+    out_csv = f"{slug}_depth.csv"
+    print(f"Writing CSV: {out_csv}")
 
-            "token0_id", "token0_ask", "token0_bid", "token0_ask_size", "token0_bid_size",
-            "token0_mid", "token0_spread", "token0_ask_notional", "token0_bid_notional",
+    books = {
+        yes_token: {"bids": [], "asks": []},
+        no_token:  {"bids": [], "asks": []},
+    }
 
-            "token1_id", "token1_ask", "token1_bid", "token1_ask_size", "token1_bid_size",
-            "token1_mid", "token1_spread", "token1_ask_notional", "token1_bid_notional",
+    # open file (normal context manager), ws (async context manager)
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "ts_ny",
+            "yes_bid", "yes_ask", "yes_bid_depth", "yes_ask_depth",
+            "no_bid",  "no_ask",  "no_bid_depth",  "no_ask_depth",
         ])
         f.flush()
 
-        while time.monotonic() < end_mono:
-            now_mono = time.monotonic()
-            if now_mono < next_tick:
-                time.sleep(next_tick - now_mono)
-            next_tick += float(interval)
+        async with websockets.connect(WS_URL) as ws:
+            await ws.send(json.dumps({
+                "type": "market",
+                "assets_ids": [yes_token, no_token]
+            }))
 
-            unix_ts = time.time()
-            iso = iso_now()
+            last_snapshot = time.monotonic()
 
-            # BTC price (never None unless Binance request fails)
-            btc_price, btc_source, btc_ts_ms = get_btc_price_binance(session)
+            while True:
+                # roll when the 15-minute interval ends
+                if time.time() >= end_unix_ts:
+                    break
 
-            # Book tops (prices + sizes)
-            try:
-                t0_ask, t0_ask_s, t0_bid, t0_bid_s = get_book_top(session, token0)
-            except Exception:
-                t0_ask = t0_ask_s = t0_bid = t0_bid_s = None
+                raw = await ws.recv()
+                if raw == "PONG":
+                    continue
 
-            try:
-                t1_ask, t1_ask_s, t1_bid, t1_bid_s = get_book_top(session, token1)
-            except Exception:
-                t1_ask = t1_ask_s = t1_bid = t1_bid_s = None
+                msg = json.loads(raw)
+                updates = msg if isinstance(msg, list) else [msg]
 
-            t0_mid, t0_spread = mid_and_spread(t0_ask, t0_bid)
-            t1_mid, t1_spread = mid_and_spread(t1_ask, t1_bid)
+                for u in updates:
+                    if not isinstance(u, dict):
+                        continue
 
-            t0_ask_not = notional(t0_ask, t0_ask_s)
-            t0_bid_not = notional(t0_bid, t0_bid_s)
-            t1_ask_not = notional(t1_ask, t1_ask_s)
-            t1_bid_not = notional(t1_bid, t1_bid_s)
+                    asset = str(u.get("asset_id") or u.get("assetId") or "")
+                    if asset not in books:
+                        continue
 
-            w.writerow([
-                f"{unix_ts:.3f}", iso, event_slug,
-                btc_price, btc_source, btc_ts_ms,
+                    if "bids" in u:
+                        books[asset]["bids"] = normalize_levels(u["bids"], "bids")
+                    if "asks" in u:
+                        books[asset]["asks"] = normalize_levels(u["asks"], "asks")
 
-                token0, t0_ask, t0_bid, t0_ask_s, t0_bid_s,
-                t0_mid, t0_spread, t0_ask_not, t0_bid_not,
+                if time.monotonic() - last_snapshot >= SNAPSHOT_INTERVAL_SECONDS:
+                    last_snapshot = time.monotonic()
 
-                token1, t1_ask, t1_bid, t1_ask_s, t1_bid_s,
-                t1_mid, t1_spread, t1_ask_not, t1_bid_not,
-            ])
-            f.flush()
+                    yb = books[yes_token]["bids"][:DEPTH_LEVELS]
+                    ya = books[yes_token]["asks"][:DEPTH_LEVELS]
+                    nb = books[no_token]["bids"][:DEPTH_LEVELS]
+                    na = books[no_token]["asks"][:DEPTH_LEVELS]
 
-            print(
-                f"[{iso}] "
-                f"t0 ask={t0_ask} bid={t0_bid} (askSz={t0_ask_s} bidSz={t0_bid_s}) | "
-                f"t1 ask={t1_ask} bid={t1_bid} (askSz={t1_ask_s} bidSz={t1_bid_s}) | "
-                f"btc={btc_price} ({btc_source})"
-            )
+                    row = [
+                        now_ny_iso(),
+                        best_price(yb), best_price(ya), depth_sum(yb), depth_sum(ya),
+                        best_price(nb), best_price(na), depth_sum(nb), depth_sum(na),
+                    ]
+                    writer.writerow(row)
+                    f.flush()
 
-    return out_file
+                    print(
+                        f"{row[0]}  "
+                        f"YES bid={row[1]} ask={row[2]}   "
+                        f"NO bid={row[5]} ask={row[6]}"
+                    )
 
 
-# -----------------------
-# CLI
-# -----------------------
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Collect Polymarket book snapshots at ~1 Hz.")
-    g = parser.add_mutually_exclusive_group(required=True)
-    g.add_argument("--event-url", type=str, help="Polymarket event URL")
-    g.add_argument("--slug", type=str, help="Event slug, e.g. btc-updown-15m-1766514600")
+# ======================
+# RUN FOREVER (auto-advance slug every 15 minutes)
+# ======================
+async def run_forever(start_slug: str):
+    prefix, ts = split_slug(start_slug)
 
-    parser.add_argument("--seconds", type=int, default=60, help="How long to collect")
-    parser.add_argument("--interval", type=float, default=1.0, help="Seconds between samples (target)")
-    parser.add_argument("--out-dir", type=str, default="data/raw", help="Output dir (relative to project root)")
+    while True:
+        slug = slug_for_timestamp(prefix, ts)
+        end_ts = ts + 900  # collect until the end of this 15-min window
 
-    args = parser.parse_args()
-    slug = args.slug if args.slug else event_slug_from_url(args.event_url)
+        try:
+            await collect_one_event(slug, end_ts)
+        except requests.HTTPError as e:
+            # sometimes the next event appears a bit late; retry a few times
+            print(f"[Gamma HTTPError for {slug}] {e}. Retrying in 2s...")
+            await asyncio.sleep(2)
+            continue
+        except Exception as e:
+            print(f"[Error for {slug}] {e}. Retrying in 2s...")
+            await asyncio.sleep(2)
+            continue
 
-    out = collect_every_second(
-        event_slug=slug,
-        seconds=args.seconds,
-        interval=args.interval,
-        out_dir=args.out_dir,
-    )
-    print(f"\nWrote: {out}")
+        # advance to next 15-min slug
+        ts = next_15m_timestamp(ts)
+
+        # if we finished early for any reason, wait until the next boundary
+        # (keeps rollovers aligned)
+        now = time.time()
+        if now < ts:
+            await asyncio.sleep(ts - now)
+
+
+def main():
+    asyncio.run(run_forever(EVENT_SLUG))
 
 
 if __name__ == "__main__":
