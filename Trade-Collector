@@ -1,0 +1,132 @@
+import requests
+import csv
+import time
+from datetime import datetime, timezone
+
+USER = "0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d"
+SLUG = "btc-updown-15m-1767031200"
+
+GAMMA_API = "https://gamma-api.polymarket.com"
+DATA_API  = "https://data-api.polymarket.com"
+
+def ts_to_iso(ts) -> str:
+    """
+    Converts Polymarket timestamps to ISO-8601 UTC.
+    If timestamp looks like milliseconds, convert to seconds.
+    """
+    if ts is None:
+        return ""
+    ts_int = int(ts)
+    if ts_int > 10**12:  # ms
+        ts_int //= 1000
+    return datetime.fromtimestamp(ts_int, tz=timezone.utc).isoformat()
+
+def fetch_event_id_from_slug(slug: str) -> int:
+    r = requests.get(f"{GAMMA_API}/events/slug/{slug}", timeout=20)
+    r.raise_for_status()
+    event = r.json()
+    if "id" not in event:
+        raise ValueError(f"No 'id' in Gamma response for slug={slug}")
+    return int(event["id"])
+
+def fetch_all_trades(user: str, event_id: int, batch_size: int = 500, taker_only: bool = False):
+    """
+    Paginate /trades until the API returns an empty list.
+    """
+    all_trades = []
+    offset = 0
+
+    while True:
+        params = {
+            "user": user,
+            "eventId": event_id,
+            "limit": batch_size,
+            "offset": offset,
+            "takerOnly": str(taker_only).lower(),
+        }
+
+        r = requests.get(f"{DATA_API}/trades", params=params, timeout=30)
+
+        # If you ever hit rate limits, this helps avoid crashing
+        if r.status_code == 429:
+            print("Rate limited (429). Sleeping 2s...")
+            time.sleep(2)
+            continue
+
+        r.raise_for_status()
+        page = r.json()
+
+        if not page:
+            break
+
+        all_trades.extend(page)
+        offset += len(page)
+
+        print(f"Fetched {len(page)} trades... total so far = {len(all_trades)}")
+
+        # If the API returns fewer than requested, you're likely at the end
+        if len(page) < batch_size:
+            break
+
+    return all_trades
+
+def main():
+    event_id = fetch_event_id_from_slug(SLUG)
+    print(f"Slug: {SLUG}")
+    print(f"Gamma eventId: {event_id}")
+
+    trades = fetch_all_trades(USER, event_id, batch_size=500, taker_only=False)
+    print(f"Fetched {len(trades)} trades for user in eventId={event_id}")
+
+    # Extra safety: keep only the exact slug you asked for
+    trades_for_slug = [t for t in trades if t.get("slug") == SLUG or t.get("eventSlug") == SLUG]
+    print(f"After slug filter: {len(trades_for_slug)} trades match slug={SLUG}")
+
+    # Sort by timestamp ascending (oldest -> newest) so CSV is easy to analyze
+    trades_for_slug.sort(key=lambda t: int(t.get("timestamp") or 0))
+
+    out_csv = f"{USER[:10]}_{SLUG}_trades.csv".replace(":", "_")
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "timestamp_utc",
+            "side",
+            "price",
+            "size",
+            "outcome",
+            "slug",
+            "eventSlug",
+            "conditionId",
+            "transactionHash",
+        ])
+
+        for t in trades_for_slug:
+            w.writerow([
+                ts_to_iso(t.get("timestamp")),
+                t.get("side"),
+                t.get("price"),
+                t.get("size"),
+                t.get("outcome"),
+                t.get("slug"),
+                t.get("eventSlug"),
+                t.get("conditionId"),
+                t.get("transactionHash"),
+            ])
+
+    print(f"Saved CSV: {out_csv}")
+
+    # If you truly want to print every trade, loop over trades_for_slug with no slicing.
+    # WARNING: this can be huge.
+    print("\nMost recent 750 trades (change this number if you want):")
+    for t in trades_for_slug[-1500:]:
+        print(
+            ts_to_iso(t.get("timestamp")),
+            t.get("side"),
+            "price=", t.get("price"),
+            "size=", t.get("size"),
+            "outcome=", t.get("outcome"),
+            "tx=", t.get("transactionHash"),
+        )
+
+if __name__ == "__main__":
+    main()
