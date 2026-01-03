@@ -569,14 +569,14 @@ def parse_args():
     p.add_argument("--out", default="out/actions_log.csv", help="Output CSV for action log.")
 
     # Defaults tuned to be less strict (more trades):
-    p.add_argument("--z", type=float, default=1.75, help="Z-score threshold (default 0.0 = OFF).")
-    p.add_argument("--edge", type=float, default=0.005, help="Probability edge threshold vs ask (default 0.005).")
+    p.add_argument("--z", type=float, default=1, help="Z-score threshold (default 0.0 = OFF).")
+    p.add_argument("--edge", type=float, default=0.05, help="Probability edge threshold vs ask (default 0.005).")
 
-    p.add_argument("--size", type=int, default=5, help="Shares per trade attempt (default 10).")
+    p.add_argument("--size", type=int, default=1, help="Shares per trade attempt (default 10).")
     p.add_argument("--max-pos", type=int, default=5000, help="Max shares per side (inventory cap).")
-    p.add_argument("--max-imbalance", type=int, default=100, help="Max abs(up - down) allowed.")
+    p.add_argument("--max-imbalance", type=int, default=8, help="Max abs(up - down) allowed.")
 
-    p.add_argument("--hedge-slack", type=float, default=0.1,
+    p.add_argument("--hedge-slack", type=float, default=-0.01,
                    help="Relaxed hedge slack added to (1 - avg_cost_other). Default 0.03.")
     return p.parse_args()
 
@@ -604,3 +604,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
