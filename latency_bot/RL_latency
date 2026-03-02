@@ -1,0 +1,1749 @@
+#!/usr/bin/env python3
+r"""
+RL_backtester.py  --  Bandit Q-learning backtester: learn Q(s,a) for 3 actions
+(NO_TRADE, BUY_YES, BUY_NO) using ALL requested DB columns as FEATURES and run a
+sequential simulator.
+
+NEW CHANGE (your request):
+- If the agent chooses BUY_YES or BUY_NO at time t:
+    1) Buy that side immediately at current ASK (leg 1).
+    2) After `--hedge-delay-ms` (default 3000ms), buy the OPPOSITE token in
+       EQUAL CONTRACT QTY at the ASK available at/after that time (leg 2).
+- Reward target for RL is based on whether the *pair cost* after the hedge buy
+  is <= `--pair-cost-threshold` (default 0.99).
+  Pair cost = ask_leg1 + ask_leg2  (both are token prices in [0,1] dollars).
+- Backtest models the same thing:
+    - It schedules the hedge leg and executes it at the first row >= due time.
+    - When the hedge leg executes, it books a "locked profit" (no settlement delay):
+        locked_profit_usd = (1.0 - pair_cost) * qty
+      (This is the economic arbitrage profit if you truly hold both sides to settlement,
+       ignoring fees/slippage. You can still add per-trade penalties / half-spread costs.)
+    - It also reports the success rate: pair_cost <= threshold.
+
+NOTES / ASSUMPTIONS:
+- Token prices are in *dollars* (e.g., 0.52 = 52 cents). So "0.99 cents" is treated
+  as $0.99 (99 cents). Use --pair-cost-threshold to change.
+- If the needed future ask is unavailable within the same slug, that action's target is 0
+  (NO_TRADE) for training; and in backtest the pending hedge will be dropped at slug boundary.
+
+Run (PowerShell):
+  cd "C:\Users\antho\OneDrive\Desktop\5minute";
+  $env:KMP_DUPLICATE_LIB_OK="TRUE";
+  python btc_latency\RL_backtester.py `
+    --db "C:\Users\antho\OneDrive\Desktop\5minute\btc_latency\rl_live_trades_march_first.db" `
+    --extra-train-db "C:\Users\antho\OneDrive\Desktop\5minute\btc_latency\trader_log.snapshot.db" `
+    --train-slugs 0-8 --test-slugs 9-11 --epochs 10 --device cpu `
+    --min-q-to-trade 0.10 `
+    --trade-penalty-usd 0.03 --use-half-spread-cost `
+    --cooldown-ms 750 --inv-lambda 0.10 `
+    --reward-mode pair_sign --reward-scale-usd 0.05 `
+    --hedge-delay-ms 3000 --pair-cost-threshold 0.99 `
+    --entry-notional 5 --max-qty-per-entry 50 --max-inventory-per-side 4000
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import sqlite3
+from collections import Counter
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
+
+import numpy as np
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+except ImportError as e:
+    raise SystemExit("PyTorch required. Install: pip install torch") from e
+
+HAS_MPL = True
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception:
+    HAS_MPL = False
+
+EPS = 1e-9
+_SCRIPT_DIR = Path(__file__).resolve().parent
+
+A_NO = 0
+A_BUY_YES = 1
+A_BUY_NO = 2
+ACTIONS = 3
+
+
+# ============================================================
+# Small utils
+# ============================================================
+
+def softsign(x: float) -> float:
+    return x / (1.0 + abs(x))
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def _f(x) -> Optional[float]:
+    if x is None:
+        return None
+    v = float(x)
+    return v if math.isfinite(v) else None
+
+
+def _i(x) -> Optional[int]:
+    if x is None:
+        return None
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+
+def _safe_mid(b: Optional[float], a: Optional[float]) -> Optional[float]:
+    if b is None or a is None:
+        return None
+    return 0.5 * (float(b) + float(a))
+
+
+# ============================================================
+# Row definition (includes all columns you listed)
+# ============================================================
+
+class Row(NamedTuple):
+    opp_id: int
+    t_ms: int
+    mono_ns: Optional[int]
+    bin_evt_ms: Optional[int]
+    poly_evt_ms: Optional[int]
+    slug: str
+
+    yes_token_id: Optional[str]
+    no_token_id: Optional[str]
+
+    yes_bid: Optional[float]
+    yes_ask: Optional[float]
+    no_bid: Optional[float]
+    no_ask: Optional[float]
+    yes_mid: Optional[float]
+    no_mid: Optional[float]
+
+    yes_bid_sz: Optional[float]
+    yes_ask_sz: Optional[float]
+    no_bid_sz: Optional[float]
+    no_ask_sz: Optional[float]
+
+    spread_yes_c: Optional[float]
+    spread_no_c: Optional[float]
+
+    bin_mid: Optional[float]
+    bin_dS: Optional[float]
+
+    fair_yes: Optional[float]
+    edge_yes_pp: Optional[float]
+    edge_no_pp: Optional[float]
+    dp_fair_cents: Optional[float]
+    dP_yes_cents: Optional[float]
+    dP_no_cents: Optional[float]
+    lag_ratio: Optional[float]
+
+    inv_yes: Optional[float]
+    inv_no: Optional[float]
+    inv_net: Optional[float]
+    inv_gross: Optional[float]
+    inv_notional: Optional[float]
+
+    sigma_eff: Optional[float]
+    T_left_sec: Optional[float]
+
+    passed_filter: Optional[int]
+    strike_k: Optional[float]
+    slope_ref_S: Optional[float]
+    bin_move_from_ref: Optional[float]
+    bin_vol_1h: Optional[float]
+
+    # labels may exist but are NOT USED for reward now
+    pnl_1s_yes: Optional[float]
+    pnl_1s_no: Optional[float]
+    best_pnl_1s: Optional[float]
+
+
+# ============================================================
+# DB helpers
+# ============================================================
+
+def _connect_ro(db_path: Path) -> sqlite3.Connection:
+    try:
+        return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except Exception:
+        return sqlite3.connect(str(db_path))
+
+
+def _apply_read_pragmas(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("PRAGMA temp_store=MEMORY;")
+        conn.execute("PRAGMA cache_size=-200000;")   # ~200MB (KB units)
+        conn.execute("PRAGMA mmap_size=268435456;")  # 256MB
+    except Exception:
+        pass
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    cur = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (name,),
+    )
+    return cur.fetchone() is not None
+
+
+def _get_columns(conn: sqlite3.Connection, table: str) -> Set[str]:
+    cols: Set[str] = set()
+    try:
+        for _, name, *_ in conn.execute(f"PRAGMA table_info({table})"):
+            cols.add(str(name))
+    except Exception:
+        pass
+    return cols
+
+
+def _ensure_indexes(conn: sqlite3.Connection) -> None:
+    try:
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_opp_tms        ON opportunities(t_ms);
+            CREATE INDEX IF NOT EXISTS idx_opp_slug_tms   ON opportunities(slug, t_ms);
+            CREATE INDEX IF NOT EXISTS idx_opp_oppid      ON opportunities(opp_id);
+            CREATE INDEX IF NOT EXISTS idx_out_opp_label  ON outcomes(opp_id, label_t_ms);
+            """
+        )
+        conn.commit()
+    except Exception:
+        pass
+
+
+def load_ordered_slugs(db_path: Path) -> List[str]:
+    db_path = Path(db_path)
+    if not db_path.exists():
+        raise FileNotFoundError(f"DB not found: {db_path}")
+
+    conn = _connect_ro(db_path)
+    _apply_read_pragmas(conn)
+    conn.row_factory = None
+    q = """
+    SELECT slug
+    FROM opportunities
+    WHERE slug IS NOT NULL AND slug != ''
+    GROUP BY slug
+    ORDER BY MIN(t_ms) ASC;
+    """
+    out = [r[0] for r in conn.execute(q)]
+    conn.close()
+    return out
+
+
+def load_rows(db_path: Path, *, slug_whitelist: Optional[Set[str]] = None) -> List[Row]:
+    db_path = Path(db_path)
+    if not db_path.exists():
+        raise FileNotFoundError(f"DB not found: {db_path}")
+
+    conn = sqlite3.connect(str(db_path))
+    _apply_read_pragmas(conn)
+    _ensure_indexes(conn)
+    conn.row_factory = None
+
+    if not _table_exists(conn, "opportunities"):
+        conn.close()
+        raise RuntimeError("DB has no table named 'opportunities'")
+
+    opp_cols = _get_columns(conn, "opportunities")
+    has_outcomes = _table_exists(conn, "outcomes")
+    out_cols = _get_columns(conn, "outcomes") if has_outcomes else set()
+
+    def ocol(name: str) -> str:
+        return f"o.{name} AS {name}" if name in opp_cols else f"NULL AS {name}"
+
+    def ocol_ref(name: str) -> str:
+        return f"o.{name}" if name in opp_cols else "NULL"
+
+    def label_expr(name: str) -> str:
+        if has_outcomes and name in out_cols:
+            return f"oc.{name} AS {name}"
+        if name in opp_cols:
+            return f"o.{name} AS {name}"
+        return f"NULL AS {name}"
+
+    slug_filter_sql = ""
+    params: Tuple = ()
+    if slug_whitelist:
+        wl = [s for s in slug_whitelist if s]
+        if wl:
+            slug_filter_sql = "WHERE o.slug IN ({})".format(",".join("?" for _ in wl))
+            params = tuple(wl)
+
+    join_sql = ""
+    if has_outcomes:
+        join_sql = """
+        LEFT JOIN outcomes oc
+          ON oc.opp_id = o.opp_id
+         AND oc.label_t_ms = (
+              SELECT MAX(oc2.label_t_ms) FROM outcomes oc2 WHERE oc2.opp_id = o.opp_id
+         )
+        """
+
+    q = f"""
+    SELECT
+      {ocol("opp_id")},
+      {ocol("t_ms")},
+      {ocol("mono_ns")},
+      {ocol("bin_evt_ms")},
+      {ocol("poly_evt_ms")},
+      COALESCE({ocol_ref("slug")}, '') AS slug,
+
+      {ocol("yes_token_id")},
+      {ocol("no_token_id")},
+
+      {ocol("yes_bid")},
+      {ocol("yes_ask")},
+      {ocol("no_bid")},
+      {ocol("no_ask")},
+      {ocol("yes_mid")},
+      {ocol("no_mid")},
+
+      {ocol("yes_bid_sz")},
+      {ocol("yes_ask_sz")},
+      {ocol("no_bid_sz")},
+      {ocol("no_ask_sz")},
+
+      {ocol("spread_yes_c")},
+      {ocol("spread_no_c")},
+
+      {ocol("bin_mid")},
+      {ocol("bin_dS")},
+
+      {ocol("fair_yes")},
+      {ocol("edge_yes_pp")},
+      {ocol("edge_no_pp")},
+      {ocol("dp_fair_cents")},
+      {ocol("dP_yes_cents")},
+      {ocol("dP_no_cents")},
+      {ocol("lag_ratio")},
+
+      {ocol("inv_yes")},
+      {ocol("inv_no")},
+      {ocol("inv_net")},
+      {ocol("inv_gross")},
+      {ocol("inv_notional")},
+
+      {ocol("sigma_eff")},
+      {ocol("T_left_sec")},
+
+      {ocol("passed_filter")},
+      {ocol("strike_k")},
+      {ocol("slope_ref_S")},
+      {ocol("bin_move_from_ref")},
+      {ocol("bin_vol_1h")},
+
+      {label_expr("pnl_1s_yes")},
+      {label_expr("pnl_1s_no")},
+      {label_expr("best_pnl_1s")}
+
+    FROM opportunities o
+    {join_sql}
+    {slug_filter_sql}
+    ORDER BY o.t_ms;
+    """
+
+    rows: List[Row] = []
+    app = rows.append
+    for t in conn.execute(q, params):
+        app(Row(
+            int(t[0] or 0),
+            int(t[1] or 0),
+            _i(t[2]),
+            _i(t[3]),
+            _i(t[4]),
+            str(t[5] or ""),
+
+            (str(t[6]) if t[6] is not None else None),
+            (str(t[7]) if t[7] is not None else None),
+
+            _f(t[8]), _f(t[9]), _f(t[10]), _f(t[11]), _f(t[12]), _f(t[13]),
+            _f(t[14]), _f(t[15]), _f(t[16]), _f(t[17]),
+
+            _f(t[18]), _f(t[19]),
+
+            _f(t[20]), _f(t[21]),
+
+            _f(t[22]), _f(t[23]), _f(t[24]), _f(t[25]), _f(t[26]), _f(t[27]), _f(t[28]),
+
+            _f(t[29]), _f(t[30]), _f(t[31]), _f(t[32]), _f(t[33]),
+
+            _f(t[34]), _f(t[35]),
+
+            (int(t[36]) if t[36] is not None else None),
+            _f(t[37]), _f(t[38]), _f(t[39]), _f(t[40]),
+
+            _f(t[41]), _f(t[42]), _f(t[43]),
+        ))
+    conn.close()
+    return rows
+
+
+# ============================================================
+# Slug splitting
+# ============================================================
+
+def parse_index_list(raw: str, n_slugs: int) -> List[int]:
+    indices: List[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            indices.extend(range(int(lo), int(hi) + 1))
+        else:
+            indices.append(int(part))
+    return [i for i in indices if 0 <= i < n_slugs]
+
+
+def split_slug_sets(
+    ordered_slugs: List[str],
+    train_indices: List[int],
+    test_indices: List[int],
+) -> Tuple[Set[str], Set[str], List[str], List[str]]:
+    n = len(ordered_slugs)
+    train_slugs = [ordered_slugs[i] for i in train_indices if 0 <= i < n]
+    test_slugs = [ordered_slugs[i] for i in test_indices if 0 <= i < n]
+    return set(train_slugs), set(test_slugs), train_slugs, test_slugs
+
+
+# ============================================================
+# Features (40 dims)
+# ============================================================
+
+FEATURE_NAMES: List[str] = [
+    # time/latency
+    "t_ms_norm",
+    "mono_ns_norm",
+    "bin_evt_age_ms_ss",
+    "poly_evt_age_ms_ss",
+    "bin_poly_evt_skew_ms_ss",
+    "lag_ratio_ss",
+
+    # prices/book
+    "yes_bid",
+    "yes_ask",
+    "no_bid",
+    "no_ask",
+    "yes_mid",
+    "no_mid",
+    "spread_yes_c",
+    "spread_no_c",
+
+    # depth sizes
+    "yes_bid_sz_ss",
+    "yes_ask_sz_ss",
+    "no_bid_sz_ss",
+    "no_ask_sz_ss",
+    "imb_yes_ss",
+    "imb_no_ss",
+
+    # binance
+    "bin_mid_norm_ss",
+    "bin_dS_ss",
+
+    # model/edges/deltas
+    "fair_yes",
+    "fair_no",
+    "edge_yes_pp_ss",
+    "edge_no_pp_ss",
+    "dp_fair_cents_ss",
+    "dP_yes_cents_ss",
+    "dP_no_cents_ss",
+
+    # vol/time
+    "sigma_eff_ss",
+    "bin_vol_1h_ss",
+    "T_left_sec_ss",
+
+    # inventory (overridden by sim inventory in backtest)
+    "inv_yes_scaled",
+    "inv_no_scaled",
+    "inv_net_scaled",
+    "inv_gross_scaled",
+    "inv_notional_ss",
+
+    # pair cost (yes_ask + no_ask -- the key arb signal)
+    "pair_cost_ss",
+
+    # filter bit + cal refs
+    "passed_filter",
+    "strike_k_norm_ss",
+    "slope_ref_S_norm_ss",
+    "bin_move_from_ref_ss",
+]
+STATE_DIM = len(FEATURE_NAMES)
+
+
+def build_feature_vector(
+    row: Row,
+    args: argparse.Namespace,
+    *,
+    inv_yes_override: Optional[float] = None,
+    inv_no_override: Optional[float] = None,
+    inv_notional_override: Optional[float] = None,
+) -> np.ndarray:
+    t_ms = float(row.t_ms)
+    t_ms_norm = (t_ms - float(args.t0_ms)) / max(1.0, float(args.t_norm_ms))
+
+    mono_ns_norm = 0.0
+    if row.mono_ns is not None:
+        mono_ns_norm = (float(row.mono_ns) - float(args.mono0_ns)) / max(1.0, float(args.mono_norm_ns))
+
+    bin_evt_age_ms = 0.0 if row.bin_evt_ms is None else (t_ms - float(row.bin_evt_ms))
+    poly_evt_age_ms = 0.0 if row.poly_evt_ms is None else (t_ms - float(row.poly_evt_ms))
+    bin_poly_evt_skew_ms = 0.0
+    if row.bin_evt_ms is not None and row.poly_evt_ms is not None:
+        bin_poly_evt_skew_ms = float(row.bin_evt_ms) - float(row.poly_evt_ms)
+
+    lag_ratio = float(row.lag_ratio or 0.0)
+
+    yes_mid = row.yes_mid if row.yes_mid is not None else _safe_mid(row.yes_bid, row.yes_ask)
+    no_mid = row.no_mid if row.no_mid is not None else _safe_mid(row.no_bid, row.no_ask)
+
+    ybs = float(row.yes_bid_sz or 0.0)
+    yas = float(row.yes_ask_sz or 0.0)
+    nbs = float(row.no_bid_sz or 0.0)
+    nas = float(row.no_ask_sz or 0.0)
+    imb_yes = (ybs - yas) / (ybs + yas + 1e-6)
+    imb_no = (nbs - nas) / (nbs + nas + 1e-6)
+
+    inv_yes = float(inv_yes_override) if inv_yes_override is not None else float(row.inv_yes or 0.0)
+    inv_no = float(inv_no_override) if inv_no_override is not None else float(row.inv_no or 0.0)
+    inv_net = inv_yes - inv_no
+    inv_gross = inv_yes + inv_no
+
+    inv_notional = float(inv_notional_override) if inv_notional_override is not None else float(row.inv_notional or 0.0)
+
+    cap_yes = max(1.0, float(args.max_yes))
+    cap_no = max(1.0, float(args.max_no))
+    cap_net = max(1.0, float(args.max_net))
+
+    inv_yes_scaled = inv_yes / cap_yes
+    inv_no_scaled = inv_no / cap_no
+    inv_net_scaled = inv_net / cap_net
+    inv_gross_scaled = inv_gross / max(1.0, cap_yes + cap_no)
+
+    feats = np.asarray(
+        [
+            float(t_ms_norm),
+            float(mono_ns_norm),
+            softsign(bin_evt_age_ms / max(1.0, float(args.age_scale_ms))),
+            softsign(poly_evt_age_ms / max(1.0, float(args.age_scale_ms))),
+            softsign(bin_poly_evt_skew_ms / max(1.0, float(args.age_scale_ms))),
+            softsign(lag_ratio),
+
+            float(row.yes_bid or 0.0),
+            float(row.yes_ask or 0.0),
+            float(row.no_bid or 0.0),
+            float(row.no_ask or 0.0),
+            float(yes_mid or 0.0),
+            float(no_mid or 0.0),
+            float(row.spread_yes_c or 0.0),
+            float(row.spread_no_c or 0.0),
+
+            softsign(ybs / max(1.0, float(args.sz_scale))),
+            softsign(yas / max(1.0, float(args.sz_scale))),
+            softsign(nbs / max(1.0, float(args.sz_scale))),
+            softsign(nas / max(1.0, float(args.sz_scale))),
+            softsign(imb_yes),
+            softsign(imb_no),
+
+            softsign(float(row.bin_mid or 0.0) / max(1.0, float(args.bin_mid_scale))),
+            softsign(float(row.bin_dS or 0.0) / max(EPS, float(args.bin_dS_scale))),
+
+            float(row.fair_yes or 0.0),
+            float((1.0 - float(row.fair_yes)) if row.fair_yes is not None else 0.0),
+            softsign(float(row.edge_yes_pp or 0.0) / max(1.0, float(args.edge_scale_pp))),
+            softsign(float(row.edge_no_pp or 0.0) / max(1.0, float(args.edge_scale_pp))),
+            softsign(float(row.dp_fair_cents or 0.0) / max(1.0, float(args.dp_scale_cents))),
+            softsign(float(row.dP_yes_cents or 0.0) / max(1.0, float(args.dp_scale_cents))),
+            softsign(float(row.dP_no_cents or 0.0) / max(1.0, float(args.dp_scale_cents))),
+
+            softsign(float(row.sigma_eff or 0.0) / max(EPS, float(args.sigma_scale))),
+            softsign(float(row.bin_vol_1h or 0.0) / max(EPS, float(args.sigma_scale))),
+            softsign(float(row.T_left_sec or 0.0) / max(1.0, float(args.T_scale_sec))),
+
+            clamp(inv_yes_scaled, -10.0, 10.0),
+            clamp(inv_no_scaled, -10.0, 10.0),
+            clamp(inv_net_scaled, -10.0, 10.0),
+            clamp(inv_gross_scaled, -10.0, 10.0),
+            softsign(inv_notional / max(1.0, float(args.notional_scale))),
+
+            softsign((float(row.yes_ask or 0.0) + float(row.no_ask or 0.0) - 1.0) / 0.05),
+
+            float(1.0 if (row.passed_filter or 0) != 0 else 0.0),
+            softsign(float(row.strike_k or 0.0) / max(EPS, float(args.K_scale))),
+            softsign(float(row.slope_ref_S or 0.0) / max(EPS, float(args.refS_scale))),
+            softsign(float(row.bin_move_from_ref or 0.0) / max(EPS, float(args.bin_move_scale))),
+        ],
+        dtype=np.float32,
+    )
+    if feats.shape[0] != STATE_DIM:
+        raise RuntimeError(f"Feature dim mismatch: got {feats.shape[0]} expected {STATE_DIM}")
+    return feats
+
+
+# ============================================================
+# Symmetry augmentation (YES <-> NO)
+# ============================================================
+
+def swap_yes_no(row: Row) -> Row:
+    yes_bid, no_bid = row.no_bid, row.yes_bid
+    yes_ask, no_ask = row.no_ask, row.yes_ask
+    yes_mid, no_mid = row.no_mid, row.yes_mid
+
+    yes_bid_sz, no_bid_sz = row.no_bid_sz, row.yes_bid_sz
+    yes_ask_sz, no_ask_sz = row.no_ask_sz, row.yes_ask_sz
+
+    spread_yes_c, spread_no_c = row.spread_no_c, row.spread_yes_c
+
+    fair_yes = (1.0 - float(row.fair_yes)) if row.fair_yes is not None else None
+
+    edge_yes_pp, edge_no_pp = row.edge_no_pp, row.edge_yes_pp
+    dP_yes_cents, dP_no_cents = row.dP_no_cents, row.dP_yes_cents
+
+    inv_yes, inv_no = row.inv_no, row.inv_yes
+    inv_net = None
+    if inv_yes is not None or inv_no is not None:
+        inv_net = float(inv_yes or 0.0) - float(inv_no or 0.0)
+    inv_gross = None
+    if inv_yes is not None or inv_no is not None:
+        inv_gross = float(inv_yes or 0.0) + float(inv_no or 0.0)
+
+    pnl_1s_yes, pnl_1s_no = row.pnl_1s_no, row.pnl_1s_yes
+
+    return Row(
+        row.opp_id,
+        row.t_ms,
+        row.mono_ns,
+        row.bin_evt_ms,
+        row.poly_evt_ms,
+        row.slug,
+
+        row.no_token_id,
+        row.yes_token_id,
+
+        yes_bid, yes_ask, no_bid, no_ask, yes_mid, no_mid,
+        yes_bid_sz, yes_ask_sz, no_bid_sz, no_ask_sz,
+
+        spread_yes_c, spread_no_c,
+        row.bin_mid,
+        row.bin_dS,
+
+        fair_yes,
+        edge_yes_pp,
+        edge_no_pp,
+        row.dp_fair_cents,
+        dP_yes_cents,
+        dP_no_cents,
+        row.lag_ratio,
+
+        inv_yes,
+        inv_no,
+        inv_net,
+        inv_gross,
+        row.inv_notional,
+
+        row.sigma_eff,
+        row.T_left_sec,
+
+        row.passed_filter,
+        row.strike_k,
+        row.slope_ref_S,
+        row.bin_move_from_ref,
+        row.bin_vol_1h,
+
+        pnl_1s_yes,
+        pnl_1s_no,
+        row.best_pnl_1s,
+    )
+
+
+# ============================================================
+# Usability
+# ============================================================
+
+def row_is_usable(row: Row, args: argparse.Namespace) -> bool:
+    # must have books + asks/bids for both sides
+    if row.yes_ask is None or row.no_ask is None:
+        return False
+    if row.yes_bid is None or row.no_bid is None:
+        return False
+    if row.bin_mid is None or row.fair_yes is None:
+        return False
+    if row.edge_yes_pp is None or row.edge_no_pp is None:
+        return False
+    if args.require_passed_filter and (row.passed_filter or 0) == 0:
+        return False
+
+    df = abs(float(row.dp_fair_cents)) if row.dp_fair_cents is not None else 0.0
+    if df < float(args.fair_move_min_cents):
+        return False
+
+    dPy = abs(float(row.dP_yes_cents)) if row.dP_yes_cents is not None else 999.0
+    dPn = abs(float(row.dP_no_cents)) if row.dP_no_cents is not None else 999.0
+    if dPy > float(args.poly_both_moved_cents) and dPn > float(args.poly_both_moved_cents):
+        return False
+
+    return True
+
+
+# ============================================================
+# Future book in a fill window [min_delay, max_delay] (within same slug)
+# ============================================================
+
+def compute_future_book_in_window(
+    rows: List[Row],
+    min_delay_ms: int,
+    max_delay_ms: int,
+) -> Tuple[List[Optional[float]], List[Optional[float]],
+           List[Optional[float]], List[Optional[float]]]:
+    """
+    For each row i, scan all rows j in [t_i + min_delay, t_i + max_delay] within
+    the same slug and return the BEST fill price for a limit-order hedge:
+      - best_yes_ask[i] = lowest yes_ask in the window   (best taker fill)
+      - best_no_ask[i]  = lowest no_ask in the window
+      - best_yes_bid[i] = lowest yes_bid in the window   (best maker fill)
+      - best_no_bid[i]  = lowest no_bid in the window
+
+    This models: "place a limit order after min_delay, and it fills at the
+    best available price anytime in the window."
+    """
+    n = len(rows)
+    best_ya: List[Optional[float]] = [None] * n
+    best_na: List[Optional[float]] = [None] * n
+    best_yb: List[Optional[float]] = [None] * n
+    best_nb: List[Optional[float]] = [None] * n
+
+    i = 0
+    while i < n:
+        slug = rows[i].slug
+        # find end of slug block
+        k = i
+        while k < n and rows[k].slug == slug:
+            k += 1
+
+        # For each row in the slug, scan the fill window
+        win_start_ptr = i  # pointer for start of window (will advance monotonically)
+        for idx in range(i, k):
+            t_i = int(rows[idx].t_ms)
+            t_lo = t_i + int(min_delay_ms)
+            t_hi = t_i + int(max_delay_ms)
+
+            # advance win_start_ptr to first row >= t_lo
+            if win_start_ptr < idx + 1:
+                win_start_ptr = idx + 1
+            while win_start_ptr < k and int(rows[win_start_ptr].t_ms) < t_lo:
+                win_start_ptr += 1
+
+            # scan from win_start_ptr while in [t_lo, t_hi]
+            min_ya, min_na, min_yb, min_nb = None, None, None, None
+            j = win_start_ptr
+            while j < k and int(rows[j].t_ms) <= t_hi:
+                rj = rows[j]
+                if rj.yes_ask is not None:
+                    v = float(rj.yes_ask)
+                    if min_ya is None or v < min_ya:
+                        min_ya = v
+                if rj.no_ask is not None:
+                    v = float(rj.no_ask)
+                    if min_na is None or v < min_na:
+                        min_na = v
+                if rj.yes_bid is not None:
+                    v = float(rj.yes_bid)
+                    if min_yb is None or v < min_yb:
+                        min_yb = v
+                if rj.no_bid is not None:
+                    v = float(rj.no_bid)
+                    if min_nb is None or v < min_nb:
+                        min_nb = v
+                j += 1
+
+            best_ya[idx] = min_ya
+            best_na[idx] = min_na
+            best_yb[idx] = min_yb
+            best_nb[idx] = min_nb
+
+        i = k
+
+    return best_ya, best_na, best_yb, best_nb
+
+
+# ============================================================
+# Reward shaping (PAIR COST)
+# ============================================================
+
+def half_spread_cost_usd(spread_cents: Optional[float], use_half_spread: bool) -> float:
+    if not use_half_spread:
+        return 0.0
+    sc = float(spread_cents or 0.0)
+    return 0.5 * (sc / 100.0)
+
+
+def pair_cost_reward(
+    *,
+    ask_leg1: float,
+    ask_leg2: float,
+    reward_mode: str,
+    reward_scale_usd: float,
+    entry_notional_usd: float,
+    pair_cost_threshold: float,
+) -> float:
+    """
+    reward_mode:
+      - "pair_sign": +scale if (ask1+ask2) <= threshold else -scale
+      - "pair_usd" : USD locked profit for the pair at qty = entry_notional/ask1:
+            profit = (1.0 - (ask1+ask2)) * qty
+        (This is the economically clean objective for buying both sides.)
+    """
+    c = float(ask_leg1) + float(ask_leg2)
+
+    if reward_mode == "pair_usd":
+        qty = float(entry_notional_usd) / max(EPS, float(ask_leg1))
+        return (1.0 - c) * qty
+
+    # default: pair_sign
+    if c <= float(pair_cost_threshold):
+        return float(reward_scale_usd)
+    return -float(reward_scale_usd)
+
+
+def shaped_reward(
+    base: float,
+    *,
+    trade_penalty_usd: float,
+    half_spread_usd_total: float,
+) -> float:
+    r = float(base)
+    r -= float(trade_penalty_usd)
+    r -= float(half_spread_usd_total)
+    return r
+
+
+def materialize_bandit_dataset_paircost(
+    rows: List[Row],
+    *,
+    args: argparse.Namespace,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Build X and Y where Y is a 3-vector of per-action Q-targets:
+      Y[:,0] = 0 (NO_TRADE baseline)
+      Y[:,1] = shaped reward for BUY_YES (leg1 YES now, leg2 NO at t+delay) or 0 if future ask missing
+      Y[:,2] = shaped reward for BUY_NO  (leg1 NO  now, leg2 YES at t+delay) or 0 if future ask missing
+
+    Important:
+    - If future ask needed for the hedge is missing, that action target is 0 (NO_TRADE).
+    - Symmetry augmentation duplicates swapped rows AND swaps targets accordingly.
+    """
+    # Compute future book in fill window [min_delay, max_delay].
+    # Leg2 uses the BEST BID (limit-order / maker) anywhere in the window.
+    min_delay = int(getattr(args, 'hedge_min_delay_ms', 150))
+    max_delay = int(getattr(args, 'hedge_max_delay_ms', 5000))
+    fut_yes_ask, fut_no_ask, fut_yes_bid, fut_no_bid = compute_future_book_in_window(
+        rows, min_delay, max_delay
+    )
+
+    xs: List[np.ndarray] = []
+    ys: List[np.ndarray] = []
+
+    for i, r0 in enumerate(rows):
+        if not row_is_usable(r0, args):
+            continue
+
+        # For leg2 hedge: use BID if --hedge-use-bid, else use ASK (taker)
+        use_bid = getattr(args, 'hedge_use_bid', True)
+        fna_price = (fut_no_bid[i] if use_bid else fut_no_ask[i])
+        fya_price = (fut_yes_bid[i] if use_bid else fut_yes_ask[i])
+
+        candidates: List[Tuple[Row, Optional[float], Optional[float]]] = [
+            (r0, fya_price, fna_price)
+        ]
+        if args.augment_symmetry:
+            candidates.append((swap_yes_no(r0), fna_price, fya_price))
+
+        for r, fya, fna in candidates:
+            if r.yes_ask is None or r.no_ask is None:
+                continue
+
+            x = build_feature_vector(r, args)
+
+            # half-spread costs: both legs
+            c_yes = half_spread_cost_usd(r.spread_yes_c, args.use_half_spread_cost)
+            c_no = half_spread_cost_usd(r.spread_no_c, args.use_half_spread_cost)
+
+            y0 = 0.0
+
+            # BUY_YES: leg1 yes_ask now (market), leg2 no at future (bid = limit order)
+            y1 = y0
+            if fna is not None:
+                base_yes = pair_cost_reward(
+                    ask_leg1=float(r.yes_ask),
+                    ask_leg2=float(fna),        # no_bid at t+delay
+                    reward_mode=str(args.reward_mode),
+                    reward_scale_usd=float(args.reward_scale_usd),
+                    entry_notional_usd=float(args.entry_notional),
+                    pair_cost_threshold=float(args.pair_cost_threshold),
+                )
+                y1 = shaped_reward(
+                    base_yes,
+                    trade_penalty_usd=float(args.trade_penalty_usd),
+                    half_spread_usd_total=(c_yes + c_no),
+                )
+
+            # BUY_NO: leg1 no_ask now (market), leg2 yes at future (bid = limit order)
+            y2 = y0
+            if fya is not None:
+                base_no = pair_cost_reward(
+                    ask_leg1=float(r.no_ask),
+                    ask_leg2=float(fya),         # yes_bid at t+delay
+                    reward_mode=str(args.reward_mode),
+                    reward_scale_usd=float(args.reward_scale_usd),
+                    entry_notional_usd=float(args.entry_notional),
+                    pair_cost_threshold=float(args.pair_cost_threshold),
+                )
+                y2 = shaped_reward(
+                    base_no,
+                    trade_penalty_usd=float(args.trade_penalty_usd),
+                    half_spread_usd_total=(c_no + c_yes),
+                )
+
+            xs.append(x)
+            ys.append(np.asarray([y0, y1, y2], dtype=np.float32))
+
+    if not xs:
+        return np.zeros((0, STATE_DIM), dtype=np.float32), np.zeros((0, ACTIONS), dtype=np.float32)
+
+    X = np.stack(xs).astype(np.float32)
+    Y = np.stack(ys).astype(np.float32)
+    return X, Y
+
+
+# ============================================================
+# Model
+# ============================================================
+
+class QNet(nn.Module):
+    def __init__(self, in_dim: int, hidden: int, dropout: float = 0.05) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, ACTIONS),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def batch_iter(X: np.ndarray, Y: np.ndarray, bs: int, rng: np.random.Generator):
+    n = X.shape[0]
+    idx = np.arange(n)
+    rng.shuffle(idx)
+    for i in range(0, n, bs):
+        j = idx[i:i + bs]
+        yield X[j], Y[j]
+
+
+# ============================================================
+# Backtest: paired-entry simulator (leg2 after delay)
+# ============================================================
+
+def _row_yes_mid(row: Row) -> Optional[float]:
+    return row.yes_mid if row.yes_mid is not None else _safe_mid(row.yes_bid, row.yes_ask)
+
+
+def _row_no_mid(row: Row) -> Optional[float]:
+    return row.no_mid if row.no_mid is not None else _safe_mid(row.no_bid, row.no_ask)
+
+
+@dataclass
+class PendingHedge:
+    due_t_ms: int       # earliest the hedge can fill (t_entry + min_delay)
+    expire_t_ms: int    # latest the hedge can fill (t_entry + max_delay)
+    qty: float
+    side_to_buy: int    # A_BUY_YES or A_BUY_NO
+    ask_leg1: float     # price paid on leg1
+    spread_leg1_c: Optional[float]
+    best_bid2: Optional[float]  # best (lowest) bid seen so far in the window
+    spread_leg2_c: Optional[float]
+
+
+def _ask_for_action(row: Row, action: int) -> Optional[float]:
+    if action == A_BUY_YES:
+        return float(row.yes_ask) if row.yes_ask is not None else None
+    if action == A_BUY_NO:
+        return float(row.no_ask) if row.no_ask is not None else None
+    return None
+
+
+def _bid_for_action(row: Row, action: int) -> Optional[float]:
+    """Get bid price for a BUY action (limit-order / maker fill)."""
+    if action == A_BUY_YES:
+        return float(row.yes_bid) if row.yes_bid is not None else None
+    if action == A_BUY_NO:
+        return float(row.no_bid) if row.no_bid is not None else None
+    return None
+
+
+def backtest_pair_arbitrage(
+    test_rows: List[Row],
+    model: QNet,
+    args: argparse.Namespace,
+    usable_set: Optional[Set[int]] = None,
+) -> Dict:
+    """
+    Simulation:
+    - If agent takes BUY_YES or BUY_NO at time t:
+        - Execute leg1 now at ask1 with qty = entry_notional/ask1 (capped)
+        - Schedule hedge leg2 with fill window [t + min_delay, t + max_delay]
+    - When due <= current time, execute leg2 at current ask2 and:
+        - compute pair_cost = ask1 + ask2
+        - "locked_profit_usd" = (1 - pair_cost) * qty
+        - subtract trade penalties / half-spread costs if configured
+    - Inventory tracking:
+        - We track raw inventory during the delay window; after hedge executes,
+          inventory becomes paired (YES and NO both increase).
+    """
+    model.eval()
+    device = torch.device(args.device)
+
+    MIN_ADV = float(args.min_q_to_trade)
+    ENTRY_NOTIONAL = float(args.entry_notional)
+    MAX_QTY = float(args.max_qty_per_entry)
+    MAX_INV = float(args.max_inventory_per_side)
+    COOLDOWN_MS = int(args.cooldown_ms)
+    DELAY_MIN = int(args.hedge_min_delay_ms)
+    DELAY_MAX = int(args.hedge_max_delay_ms)
+    THRESH = float(args.pair_cost_threshold)
+
+    n = len(test_rows)
+    q0 = np.zeros(n, dtype=np.float64)
+    q1 = np.zeros(n, dtype=np.float64)
+    q2 = np.zeros(n, dtype=np.float64)
+    step_pnl = np.zeros(n, dtype=np.float64)
+    ts = np.zeros(n, dtype=np.int64)
+    inv_yes_arr = np.zeros(n, dtype=np.float64)
+    inv_no_arr = np.zeros(n, dtype=np.float64)
+    slug_list: List[str] = [""] * n
+
+    inv_yes_qty = 0.0
+    inv_no_qty = 0.0
+    inv_yes_cost = 0.0
+    inv_no_cost = 0.0
+
+    pending: List[PendingHedge] = []
+
+    prev_unrealized = 0.0
+    prev_slug = test_rows[0].slug if test_rows else ""
+    last_trade_t_ms = -10**18
+
+    usable_count = 0
+    entry_count = 0
+    hedge_count = 0
+    buy_yes_count = 0
+    buy_no_count = 0
+    pair_success = 0
+    pair_fail = 0
+
+    realized_locked_profit = 0.0
+
+    xbuf = torch.empty((1, STATE_DIM), dtype=torch.float32, device=device)
+
+    with torch.inference_mode():
+        for i, r in enumerate(test_rows):
+            ts[i] = int(r.t_ms)
+            slug_list[i] = r.slug
+
+            # slug boundary: reset state and drop pending
+            if r.slug != prev_slug and prev_slug:
+                inv_yes_qty = inv_no_qty = 0.0
+                inv_yes_cost = inv_no_cost = 0.0
+                prev_unrealized = 0.0
+                pending.clear()
+                prev_slug = r.slug
+                last_trade_t_ms = -10**18
+
+            # 1) Process pending hedges — fill window [due_t_ms, expire_t_ms]
+            #    While in the window, track the best (lowest) bid for the hedge side.
+            #    At expiry (or when window closes), execute at the best bid seen.
+            pnl_realized_now = 0.0
+            if pending:
+                still: List[PendingHedge] = []
+                for ph in pending:
+                    cur_t = int(r.t_ms)
+
+                    # Before window opens — just keep waiting
+                    if cur_t < int(ph.due_t_ms):
+                        still.append(ph)
+                        continue
+
+                    # Inside the fill window — track best bid/ask
+                    use_bid = getattr(args, 'hedge_use_bid', True)
+                    if use_bid:
+                        price_now = _bid_for_action(r, ph.side_to_buy)
+                    else:
+                        price_now = _ask_for_action(r, ph.side_to_buy)
+
+                    if price_now is not None and price_now > 0:
+                        if ph.best_bid2 is None or price_now < ph.best_bid2:
+                            ph.best_bid2 = price_now
+
+                    # Window hasn't expired yet — keep scanning
+                    if cur_t < int(ph.expire_t_ms):
+                        still.append(ph)
+                        continue
+
+                    # Window expired — execute at the best price seen
+                    ask2 = ph.best_bid2
+                    if ask2 is None or ask2 <= 0:
+                        # No valid price in the entire window — force fill at current
+                        if use_bid:
+                            ask2 = _bid_for_action(r, ph.side_to_buy)
+                        else:
+                            ask2 = _ask_for_action(r, ph.side_to_buy)
+                    if ask2 is None or ask2 <= 0:
+                        still.append(ph)  # still no price, keep trying
+                        continue
+
+                    # Close out the paired position: remove leg1 from inventory.
+                    if ph.side_to_buy == A_BUY_YES:
+                        inv_no_qty  -= float(ph.qty)
+                        inv_no_cost -= float(ph.ask_leg1) * float(ph.qty)
+                    else:
+                        inv_yes_qty  -= float(ph.qty)
+                        inv_yes_cost -= float(ph.ask_leg1) * float(ph.qty)
+
+                    inv_yes_qty  = max(0.0, inv_yes_qty)
+                    inv_no_qty   = max(0.0, inv_no_qty)
+                    inv_yes_cost = max(0.0, inv_yes_cost)
+                    inv_no_cost  = max(0.0, inv_no_cost)
+
+                    hedge_count += 1
+
+                    pair_cost = float(ph.ask_leg1) + float(ask2)
+                    ok = (pair_cost <= THRESH + 1e-12)
+                    if ok:
+                        pair_success += 1
+                    else:
+                        pair_fail += 1
+
+                    locked_profit = (1.0 - pair_cost) * float(ph.qty)
+                    pnl_realized_now += locked_profit
+                    realized_locked_profit += locked_profit
+
+                pending = still
+
+            # 2) Mark-to-market unrealized (mainly during delay window)
+            ym = _row_yes_mid(r)
+            nm = _row_no_mid(r)
+
+            unreal = 0.0
+            if inv_yes_qty > 0 and ym is not None:
+                avg_cost_yes = inv_yes_cost / max(EPS, inv_yes_qty)
+                unreal += (float(ym) - avg_cost_yes) * inv_yes_qty
+            if inv_no_qty > 0 and nm is not None:
+                avg_cost_no = inv_no_cost / max(EPS, inv_no_qty)
+                unreal += (float(nm) - avg_cost_no) * inv_no_qty
+
+            step_unreal = unreal - prev_unrealized
+            prev_unrealized = unreal
+
+            # step pnl includes realized locked profits + MtM change
+            step = float(pnl_realized_now) + float(step_unreal)
+            step_pnl[i] = step
+
+            # 3) Decide whether row is usable for decisions
+            is_u = (i in usable_set) if usable_set is not None else row_is_usable(r, args)
+            if not is_u:
+                inv_yes_arr[i] = inv_yes_qty
+                inv_no_arr[i] = inv_no_qty
+                continue
+            usable_count += 1
+
+            # build features with sim inventory overrides
+            inv_notional_sim = 0.0
+            if ym is not None:
+                inv_notional_sim += inv_yes_qty * float(ym)
+            if nm is not None:
+                inv_notional_sim += inv_no_qty * float(nm)
+
+            x = build_feature_vector(
+                r,
+                args,
+                inv_yes_override=inv_yes_qty,
+                inv_no_override=inv_no_qty,
+                inv_notional_override=inv_notional_sim,
+            )
+            xbuf[0].copy_(torch.from_numpy(x))
+            q = model(xbuf).detach().cpu().numpy().reshape(-1)
+            q0[i], q1[i], q2[i] = float(q[0]), float(q[1]), float(q[2])
+
+            # cooldown between NEW entries (not hedges)
+            if (int(r.t_ms) - int(last_trade_t_ms)) < COOLDOWN_MS:
+                inv_yes_arr[i] = inv_yes_qty
+                inv_no_arr[i] = inv_no_qty
+                continue
+
+            # Model-driven action selection: pick argmax(Q) and gate on advantage
+            a = int(np.argmax(q))
+            adv = float(q[a] - q[A_NO])
+
+            if a != A_NO and adv >= MIN_ADV:
+                ask1 = _ask_for_action(r, a)
+                if ask1 is not None and ask1 > 0:
+                    qty = ENTRY_NOTIONAL / max(EPS, float(ask1))
+                    qty = min(qty, MAX_QTY)
+
+                    # inventory caps apply to leg1 immediately (since you really do hold it for ~3s)
+                    if a == A_BUY_YES:
+                        room = max(0.0, MAX_INV - inv_yes_qty)
+                        qty = min(qty, room)
+                    else:
+                        room = max(0.0, MAX_INV - inv_no_qty)
+                        qty = min(qty, room)
+
+                    if qty > 0:
+                        last_trade_t_ms = int(r.t_ms)
+                        entry_count += 1
+
+                        # execute leg1
+                        if a == A_BUY_YES:
+                            buy_yes_count += 1
+                            inv_yes_cost += float(ask1) * qty
+                            inv_yes_qty += qty
+                            hedge_side = A_BUY_NO
+                            sp1 = r.spread_yes_c
+                            sp2 = r.spread_no_c
+                        else:
+                            buy_no_count += 1
+                            inv_no_cost += float(ask1) * qty
+                            inv_no_qty += qty
+                            hedge_side = A_BUY_YES
+                            sp1 = r.spread_no_c
+                            sp2 = r.spread_yes_c
+
+                        # schedule hedge leg2 with fill window
+                        pending.append(
+                            PendingHedge(
+                                due_t_ms=int(r.t_ms) + DELAY_MIN,
+                                expire_t_ms=int(r.t_ms) + DELAY_MAX,
+                                qty=float(qty),
+                                side_to_buy=int(hedge_side),
+                                ask_leg1=float(ask1),
+                                spread_leg1_c=sp1,
+                                spread_leg2_c=sp2,
+                                best_bid2=None,
+                            )
+                        )
+
+            inv_yes_arr[i] = inv_yes_qty
+            inv_no_arr[i] = inv_no_qty
+
+    cum_pnl = float(step_pnl.sum())
+    return dict(
+        q0=q0, q1=q1, q2=q2,
+        step_pnl=step_pnl,
+        ts_arr=ts,
+        slug_all=slug_list,
+        inv_yes_all=inv_yes_arr,
+        inv_no_all=inv_no_arr,
+        usable_count=usable_count,
+        entry_count=entry_count,
+        hedge_count=hedge_count,
+        buy_yes_count=buy_yes_count,
+        buy_no_count=buy_no_count,
+        pair_success=pair_success,
+        pair_fail=pair_fail,
+        realized_locked_profit=realized_locked_profit,
+        cum_pnl=cum_pnl,
+        total_rows=n,
+    )
+
+
+# ============================================================
+# Plot
+# ============================================================
+
+def plot_backtest(res: Dict, args: argparse.Namespace, out_path: str) -> None:
+    if not HAS_MPL:
+        print("matplotlib not available -- skipping plot.")
+        return
+
+    step_pnl = res["step_pnl"]
+    ts_arr = res["ts_arr"]
+    slug_all = res["slug_all"]
+    inv_yes = res["inv_yes_all"]
+    inv_no = res["inv_no_all"]
+
+    cum = np.cumsum(step_pnl)
+
+    entries = int(res["entry_count"])
+    hedges = int(res["hedge_count"])
+    usable = int(res["usable_count"])
+    pct = (entries / usable * 100.0) if usable else 0.0
+
+    times = [datetime.fromtimestamp(int(t) / 1000.0) for t in ts_arr]
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+    ax1, ax2 = axes
+
+    ax1.plot(
+        times, cum, linewidth=2.0, alpha=0.85,
+        label=f"Cum PnL (locked_profit + MtM) | entries={entries}/{usable} ({pct:.1f}%) | hedges={hedges}"
+    )
+    ax1.axhline(y=0, linestyle="--", alpha=0.4)
+    ax1.set_ylabel("Cumulative P&L (USD)")
+    ax1.grid(True, alpha=0.25)
+    ax1.legend(loc="best")
+
+    ax2.plot(times, inv_yes, linewidth=1.5, alpha=0.85, label="YES inventory")
+    ax2.plot(times, inv_no, linewidth=1.5, alpha=0.85, label="NO inventory")
+    ax2.axhline(y=float(args.max_inventory_per_side), linestyle="--", alpha=0.4, label="Inv cap/side")
+    ax2.set_ylabel("Inventory (contracts)")
+    ax2.set_xlabel("Time")
+    ax2.grid(True, alpha=0.25)
+    ax2.legend(loc="best")
+
+    for i in range(1, len(slug_all)):
+        if slug_all[i] != slug_all[i - 1]:
+            ax1.axvline(x=times[i], linestyle=":", alpha=0.3, linewidth=1)
+            ax2.axvline(x=times[i], linestyle=":", alpha=0.3, linewidth=1)
+
+    fig.suptitle(f"Bandit Q Backtest (hedge window {args.hedge_min_delay_ms}-{args.hedge_max_delay_ms}ms, threshold={args.pair_cost_threshold})")
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"Saved plot -> {out_path}")
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Bandit Q-learning backtester (NO, BUY_YES, BUY_NO) with PAIR-COST reward.")
+
+    # DB
+    p.add_argument("--db", type=str, default=str(_SCRIPT_DIR / "rl_live_trades.db"))
+    p.add_argument("--extra-train-db", type=str, default="",
+                   help="Additional training DB (e.g., trader_log.snapshot.db). All rows used for training.")
+
+    p.add_argument("--train-slugs", type=str, default="0-5")
+    p.add_argument("--test-slugs", type=str, default="6-7")
+
+    # Training
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--batch-size", type=int, default=2048)
+    p.add_argument("--hidden", type=int, default=256)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--device", type=str, default="cpu")
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--grad-clip", type=float, default=5.0)
+    p.add_argument("--loss", type=str, default="huber", choices=["huber", "mse"])
+    p.add_argument("--huber-delta", type=float, default=1.0)
+
+    # Usable filters
+    p.add_argument("--fair-move-min-cents", type=float, default=0.10)
+    p.add_argument("--poly-both-moved-cents", type=float, default=1.0)
+    p.add_argument("--require-passed-filter", action="store_true")
+
+    # PAIR (hedge) config
+    p.add_argument("--hedge-min-delay-ms", type=int, default=150,
+                   help="Earliest the limit-order hedge can fill (ms). ~150ms = order placement latency.")
+    p.add_argument("--hedge-max-delay-ms", type=int, default=5000,
+                   help="Latest the limit-order hedge can fill (ms). "
+                        "Best price in [min, max] window is used.")
+    p.add_argument("--pair-cost-threshold", type=float, default=1.0,
+                   help="Success threshold for (leg1+leg2). 1.0 = break-even; <1.0 = require profit margin.")
+    p.add_argument("--hedge-use-bid", action="store_true", default=True,
+                   help="Hedge leg2 at the BID (limit-order / maker). Saves one side of spread. Default True.")
+    p.add_argument("--no-hedge-use-bid", dest="hedge_use_bid", action="store_false",
+                   help="Hedge leg2 at the ASK (taker, market order).")
+
+    # Reward config
+    p.add_argument("--reward-mode", type=str, default="pair_usd", choices=["pair_sign", "pair_usd"],
+                   help="pair_sign: +scale if pair_cost<=threshold else -scale; pair_usd: (1 - pair_cost)*qty.  "
+                        "pair_usd gives a continuous signal that is much easier for the model to learn.")
+    p.add_argument("--reward-scale-usd", type=float, default=1.0,
+                   help="Used only if --reward-mode pair_sign.  Use 1.0 for clean ±1 targets.")
+
+    # Reward shaping penalties
+    p.add_argument("--trade-penalty-usd", type=float, default=0.0,
+                   help="Flat USD penalty per *pair* (pushes NO_TRADE).")
+    p.add_argument("--use-half-spread-cost", action="store_true",
+                   help="Subtract 0.5*spread for EACH leg from reward/profit (spread_*_c are cents).")
+    p.add_argument("--inv-lambda", type=float, default=0.0,
+                   help="(Deprecated / unused in training; kept for CLI compat.)")
+
+    # Symmetry augmentation (ON by default)
+    p.add_argument("--no-augment-symmetry", action="store_true",
+                   help="Disable YES<->NO symmetry augmentation (not recommended).")
+
+    # Decision threshold
+    p.add_argument("--min-q-to-trade", type=float, default=0.01,
+                   help="Trade only if (Q_best - Q_no_trade) >= this.")
+
+    # Sequential sim knobs
+    p.add_argument("--cooldown-ms", type=int, default=0,
+                   help="Min milliseconds between NEW entries (hedges are exempt).")
+    p.add_argument("--entry-notional", type=float, default=5.0,
+                   help="Dollars to spend on leg1 per entry (qty = entry_notional / ask1).")
+    p.add_argument("--max-qty-per-entry", type=float, default=50.0,
+                   help="Max contracts per entry.")
+    p.add_argument("--max-inventory-per-side", type=float, default=20000.0,
+                   help="Max inventory per side (contracts).")
+
+    # Output
+    p.add_argument("--save-model", type=str, default=str(_SCRIPT_DIR / "qnet_state.pt"))
+    p.add_argument("--out-plot", type=str, default="bandit_q_backtest.png")
+
+    # Feature scaling
+    p.add_argument("--t-norm-ms", type=float, default=60_000.0)
+    p.add_argument("--mono-norm-ns", type=float, default=1e12)
+    p.add_argument("--age-scale-ms", type=float, default=5_000.0)
+    p.add_argument("--sz-scale", type=float, default=1_000.0)
+
+    p.add_argument("--bin-mid-scale", type=float, default=100_000.0)
+    p.add_argument("--bin-dS-scale", type=float, default=50.0)
+
+    p.add_argument("--edge-scale-pp", type=float, default=5.0)
+    p.add_argument("--dp-scale-cents", type=float, default=2.0)
+    p.add_argument("--sigma-scale", type=float, default=0.20)
+    p.add_argument("--T-scale-sec", type=float, default=3600.0)
+    p.add_argument("--notional-scale", type=float, default=1_000.0)
+
+    p.add_argument("--K-scale", type=float, default=100_000.0)
+    p.add_argument("--refS-scale", type=float, default=100_000.0)
+    p.add_argument("--bin-move-scale", type=float, default=50.0)
+
+    # Inventory caps (feature scaling)
+    p.add_argument("--max-yes", type=float, default=1_000.0)
+    p.add_argument("--max-no", type=float, default=1_000.0)
+    p.add_argument("--max-net", type=float, default=10_000.0)
+
+    return p.parse_args()
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main() -> None:
+    args = parse_args()
+    args.augment_symmetry = (not bool(args.no_augment_symmetry))
+
+    torch.manual_seed(int(args.seed))
+    np.random.seed(int(args.seed))
+    rng = np.random.default_rng(int(args.seed))
+    device = torch.device(args.device)
+
+    db_path = Path(args.db)
+
+    print("\n" + "=" * 90)
+    print("Bandit Q-Learning Backtester (PAIR-COST reward, delayed hedge)")
+    print(f"DB: {db_path}")
+    print(f"STATE_DIM={STATE_DIM}  ACTIONS=3 (NO, BUY_YES, BUY_NO)")
+    print(f"reward_mode={args.reward_mode} reward_scale_usd={args.reward_scale_usd}")
+    print(f"hedge_window=[{args.hedge_min_delay_ms}, {args.hedge_max_delay_ms}]ms  pair_cost_threshold={args.pair_cost_threshold}")
+    print("=" * 90)
+
+    ordered_slugs = load_ordered_slugs(db_path)
+    n_slugs = len(ordered_slugs)
+
+    train_indices = parse_index_list(args.train_slugs, n_slugs)
+    test_indices = parse_index_list(args.test_slugs, n_slugs)
+    train_set, test_set, train_slugs, test_slugs = split_slug_sets(ordered_slugs, train_indices, test_indices)
+
+    if not train_slugs:
+        raise SystemExit("No training slugs selected. Check --train-slugs.")
+    if not test_slugs:
+        raise SystemExit("No test slugs selected. Check --test-slugs.")
+
+    need = train_set | test_set
+    rows_primary = load_rows(db_path, slug_whitelist=need)
+    cnt = Counter(r.slug for r in rows_primary)
+
+    print("\nSelected slugs:")
+    for sl in train_slugs:
+        print(f"  train: {sl} ({cnt[sl]:,} rows)")
+    for sl in test_slugs:
+        print(f"  test : {sl} ({cnt[sl]:,} rows)")
+
+    train_rows = [r for r in rows_primary if r.slug in train_set]
+    test_rows = [r for r in rows_primary if r.slug in test_set]
+
+    extra_train_rows: List[Row] = []
+    if args.extra_train_db:
+        extra_path = Path(args.extra_train_db)
+        if not extra_path.exists():
+            print(f"Warning: extra-train-db not found: {extra_path}")
+        else:
+            print(f"\nLoading extra training DB: {extra_path}")
+            extra_train_rows = load_rows(extra_path, slug_whitelist=None)
+            print(f"  extra rows: {len(extra_train_rows):,}")
+
+    combined_train_rows = train_rows + extra_train_rows
+
+    if not combined_train_rows and not test_rows:
+        raise SystemExit("No rows loaded.")
+    anchor = (combined_train_rows or test_rows)[0]
+    args.t0_ms = float(anchor.t_ms)
+    args.mono0_ns = float(anchor.mono_ns or 0.0)
+
+    # Usable counts (informational)
+    train_usable_n = sum(1 for r in combined_train_rows if row_is_usable(r, args))
+    test_usable_idx = [i for i, r in enumerate(test_rows) if row_is_usable(r, args)]
+    test_usable_set = set(test_usable_idx)
+    print(f"\nUsable rows: train={train_usable_n:,} (primary={len(train_rows):,} + extra={len(extra_train_rows):,}) test={len(test_usable_idx):,}")
+
+    # ---- DIAGNOSTIC: pair cost & lock rates in fill window ----
+    diag_min_delay = int(getattr(args, 'hedge_min_delay_ms', 150))
+    diag_max_delay = int(getattr(args, 'hedge_max_delay_ms', 5000))
+    fut_yes_ask, fut_no_ask, fut_yes_bid, fut_no_bid = compute_future_book_in_window(
+        combined_train_rows, diag_min_delay, diag_max_delay
+    )
+    diag_usable = [
+        i for i, r in enumerate(combined_train_rows)
+        if row_is_usable(r, args)
+    ]
+    if diag_usable:
+        pair_now_arr = []
+        pc_yes_ask_arr, pc_no_ask_arr = [], []    # leg2 at ASK (taker)
+        pc_yes_bid_arr, pc_no_bid_arr = [], []    # leg2 at BID (maker/limit)
+        dp_fair_arr, edge_y_arr, edge_n_arr, spread_arr = [], [], [], []
+        for i in diag_usable:
+            r = combined_train_rows[i]
+            ya, na = float(r.yes_ask), float(r.no_ask)
+            pair_now_arr.append(ya + na)
+            dp_fair_arr.append(abs(float(r.dp_fair_cents or 0)))
+            edge_y_arr.append(float(r.edge_yes_pp or 0))
+            edge_n_arr.append(float(r.edge_no_pp or 0))
+            s_yes = float(r.spread_yes_c or 0)
+            s_no = float(r.spread_no_c or 0)
+            spread_arr.append(s_yes + s_no)
+            # ASK-based hedge (old way)
+            fna = fut_no_ask[i]
+            pc_yes_ask_arr.append(ya + fna if fna is not None else None)
+            fya = fut_yes_ask[i]
+            pc_no_ask_arr.append(na + fya if fya is not None else None)
+            # BID-based hedge (limit order)
+            fnb = fut_no_bid[i]
+            pc_yes_bid_arr.append(ya + fnb if fnb is not None else None)
+            fyb = fut_yes_bid[i]
+            pc_no_bid_arr.append(na + fyb if fyb is not None else None)
+
+        pn = np.array(pair_now_arr)
+        dpf = np.array(dp_fair_arr)
+        spr = np.array(spread_arr)
+        ey = np.array(edge_y_arr)
+        en = np.array(edge_n_arr)
+
+        def _safe_arr(lst):
+            return np.array([x if x is not None else 99.0 for x in lst])
+
+        print("\n" + "=" * 90)
+        print(f"DIAGNOSTIC -- pair cost & lock rates (fill window [{args.hedge_min_delay_ms}, {args.hedge_max_delay_ms}]ms)")
+        print(f"  Usable rows analysed: {len(diag_usable):,}")
+        print(f"  Current pair cost (yes_ask+no_ask):")
+        print(f"    mean={pn.mean():.4f}  median={np.median(pn):.4f}  "
+              f"min={pn.min():.4f}  <1.00: {(pn < 1.0).sum()} ({(pn < 1.0).mean():.1%})")
+        s_yes_a = np.array([float(combined_train_rows[i].spread_yes_c or 0) for i in diag_usable])
+        s_no_a  = np.array([float(combined_train_rows[i].spread_no_c or 0) for i in diag_usable])
+        print(f"  Spreads (cents):")
+        print(f"    yes: mean={s_yes_a.mean():.2f}  median={np.median(s_yes_a):.1f}  <=1c: {(s_yes_a<=1).mean():.1%}")
+        print(f"    no : mean={s_no_a.mean():.2f}  median={np.median(s_no_a):.1f}  <=1c: {(s_no_a<=1).mean():.1%}")
+        print(f"    total: mean={spr.mean():.2f}  median={np.median(spr):.1f}  <=2c: {(spr<=2).mean():.1%}")
+
+        # Compare ASK vs BID hedge
+        for label, pc_y_list, pc_n_list in [
+            ("TAKER (leg2 @ ASK)", pc_yes_ask_arr, pc_no_ask_arr),
+            ("MAKER (leg2 @ BID)", pc_yes_bid_arr, pc_no_bid_arr),
+        ]:
+            pc_y = _safe_arr(pc_y_list)
+            pc_n = _safe_arr(pc_n_list)
+            have = (pc_y < 90) | (pc_n < 90)
+            best = np.minimum(pc_y, pc_n)
+            n_have = have.sum()
+            if n_have == 0:
+                continue
+            lk_y = ((pc_y < 1.0) & (pc_y < 90)).sum()
+            lk_n = ((pc_n < 1.0) & (pc_n < 90)).sum()
+            lk_best = ((best < 1.0) & have).sum()
+            print(f"\n  {label}:")
+            print(f"    BUY_YES: lock<$1 = {lk_y:,}/{n_have:,} = {lk_y/n_have:.1%}  mean_pc={pc_y[pc_y<90].mean():.4f}")
+            print(f"    BUY_NO:  lock<$1 = {lk_n:,}/{n_have:,} = {lk_n/n_have:.1%}  mean_pc={pc_n[pc_n<90].mean():.4f}")
+            print(f"    BEST:    lock<$1 = {lk_best:,}/{n_have:,} = {lk_best/n_have:.1%}")
+
+            # Direction analysis for this hedge mode
+            dir_pc = []
+            for idx_j, i in enumerate(diag_usable):
+                dp = float(combined_train_rows[i].dp_fair_cents or 0)
+                if dp > 0:
+                    pc = pc_y_list[idx_j]
+                elif dp < 0:
+                    pc = pc_n_list[idx_j]
+                else:
+                    pc = min(pc_y_list[idx_j] or 99, pc_n_list[idx_j] or 99)
+                if pc is not None and pc < 90:
+                    dir_pc.append(pc)
+            if dir_pc:
+                da = np.array(dir_pc)
+                lk_d = (da < 1.0).sum()
+                print(f"    DIRECTION-CORRECT: lock<$1 = {lk_d:,}/{len(da):,} = {lk_d/len(da):.1%}  "
+                      f"mean_pc={da.mean():.4f}  median_pc={np.median(da):.4f}")
+                # profit distribution for locked trades
+                profits = 1.0 - da[da < 1.0]
+                if profits.size:
+                    print(f"      profit when locked: mean={profits.mean()*100:.2f}c  median={np.median(profits)*100:.2f}c  total_if_$5_notional=${(profits * 5 / 0.5).sum():.2f}")
+
+        print(f"\n  edge_yes_pp: mean={ey.mean():.3f}  max={ey.max():.3f}")
+        print(f"  edge_no_pp : mean={en.mean():.3f}  max={en.max():.3f}")
+        print("=" * 90)
+
+    # Build dataset (PAIR-COST reward)
+    Xtr, Ytr = materialize_bandit_dataset_paircost(combined_train_rows, args=args)
+    if Xtr.shape[0] == 0:
+        raise SystemExit("No training samples after filtering / future-ask availability.")
+
+    print(f"\nTrain arrays: X={Xtr.shape} Y={Ytr.shape}")
+
+    # Reward stats
+    r0 = Ytr[:, 0]
+    r1 = Ytr[:, 1]
+    r2 = Ytr[:, 2]
+    pos1 = float((r1 > 0).mean()) if r1.size else 0.0
+    pos2 = float((r2 > 0).mean()) if r2.size else 0.0
+    # Non-zero reward counts (rows where future ask was available)
+    nonzero1 = float((r1 != 0).sum())
+    nonzero2 = float((r2 != 0).sum())
+    max1 = float(r1.max()) if r1.size else 0.0
+    max2 = float(r2.max()) if r2.size else 0.0
+
+    print("\nReward stats (train):")
+    print(f"  mean r0(NO)      = {float(r0.mean() if r0.size else 0.0):.6g}")
+    print(f"  mean r1(BUY_YES) = {float(r1.mean() if r1.size else 0.0):.6g} | pos_rate={pos1:.3f} | max={max1:.6g} | nonzero={nonzero1:.0f}")
+    print(f"  mean r2(BUY_NO)  = {float(r2.mean() if r2.size else 0.0):.6g} | pos_rate={pos2:.3f} | max={max2:.6g} | nonzero={nonzero2:.0f}")
+
+    if pos1 < 0.01 and pos2 < 0.01:
+        print("  *** WARNING: pos_rate ~ 0% -- model will learn to NEVER trade.")
+        print("      Consider: --reward-mode pair_usd, lower --trade-penalty-usd, or wider --pair-cost-threshold")
+    elif max1 < 0.005 and max2 < 0.005:
+        print("  *** WARNING: max positive reward near zero -- penalties likely consuming the entire signal.")
+        print("      Consider: --reward-mode pair_usd (continuous signal), or lower --trade-penalty-usd")
+
+    # Oversample profitable examples so the model gets balanced exposure.
+    # Without this, the ~86% negative examples drown out the signal.
+    pos_mask = (Ytr[:, 1] > 0) | (Ytr[:, 2] > 0)
+    n_pos = int(pos_mask.sum())
+    n_neg = int((~pos_mask).sum())
+    if n_pos > 0 and n_neg > n_pos:
+        repeats = max(1, round(n_neg / n_pos)) - 1
+        if repeats > 0:
+            Xtr = np.concatenate([Xtr, np.tile(Xtr[pos_mask], (repeats, 1))])
+            Ytr = np.concatenate([Ytr, np.tile(Ytr[pos_mask], (repeats, 1))])
+            print(f"\n  Oversampled {n_pos} positive rows x{repeats} -> total {Xtr.shape[0]:,} training samples")
+
+    # Model
+    model = QNet(in_dim=STATE_DIM, hidden=int(args.hidden)).to(device)
+    model_path = Path(args.save_model)
+
+    opt = optim.Adam(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+    loss_fn = nn.HuberLoss(delta=float(args.huber_delta)) if args.loss == "huber" else nn.MSELoss()
+
+    print("\n" + "=" * 90)
+    print("TRAIN (regress Q(s,a) to shaped PAIR-COST rewards)")
+    for ep in range(1, int(args.epochs) + 1):
+        model.train()
+        losses = []
+        for xb, yb in batch_iter(Xtr, Ytr, int(args.batch_size), rng):
+            x = torch.from_numpy(xb).to(device)
+            y = torch.from_numpy(yb).to(device)
+            pred = model(x)
+            loss = loss_fn(pred, y)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            if float(args.grad_clip) > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip))
+            opt.step()
+            losses.append(float(loss.detach().cpu().item()))
+        print(f"Epoch {ep:>3d}/{args.epochs}  train_loss={np.mean(losses):.6g}")
+    print("=" * 90)
+
+    torch.save(model.state_dict(), str(model_path))
+    print(f"Saved model -> {model_path}")
+
+    # Backtest: keep rows with valid book
+    keep_idx = [
+        i for i, r in enumerate(test_rows)
+        if (r.yes_bid is not None and r.yes_ask is not None and r.no_bid is not None and r.no_ask is not None)
+    ]
+    all_test = [test_rows[i] for i in keep_idx]
+    if not all_test:
+        raise SystemExit("No test rows with valid book fields.")
+
+    keep_set = set(keep_idx)
+    old_to_new = {old: new for new, old in enumerate(keep_idx)}
+    bt_usable = {old_to_new[i] for i in test_usable_set if i in keep_set}
+
+    print("\n" + "=" * 90)
+    print("BACKTEST (paired entry + delayed hedge)")
+    print(f"min_q_to_trade={args.min_q_to_trade}  entry_notional=${args.entry_notional}  max_inv/side={args.max_inventory_per_side}")
+    print(f"cooldown_ms={args.cooldown_ms}  reward_mode={args.reward_mode}")
+    print(f"hedge_window=[{args.hedge_min_delay_ms}, {args.hedge_max_delay_ms}]ms  pair_cost_threshold={args.pair_cost_threshold}")
+    res = backtest_pair_arbitrage(all_test, model, args, usable_set=bt_usable)
+
+    entries = int(res["entry_count"])
+    hedges = int(res["hedge_count"])
+    usable = int(res["usable_count"])
+    cum_pnl = float(res["cum_pnl"])
+    total = int(res["total_rows"])
+    by = int(res["buy_yes_count"])
+    bn = int(res["buy_no_count"])
+    succ = int(res["pair_success"])
+    fail = int(res["pair_fail"])
+    tot_pairs = succ + fail
+    succ_rate = (succ / tot_pairs) if tot_pairs else 0.0
+    locked = float(res["realized_locked_profit"])
+
+    print("\nRESULTS:")
+    print(f"  rows   : {total:,}")
+    print(f"  usable : {usable:,}")
+    print(f"  entries: {entries:,} (BUY_YES={by}, BUY_NO={bn})")
+    print(f"  hedges : {hedges:,} (completed pairs)")
+    print(f"  pair success (cost<=thresh): {succ:,}/{tot_pairs:,} = {succ_rate:.3%}   (thresh={args.pair_cost_threshold})")
+    print(f"  realized locked profit: ${locked:.6f}")
+    print(f"  cum PnL (locked + MtM): ${cum_pnl:.6f}")
+    print("=" * 90)
+
+    plot_backtest(res, args, args.out_plot)
+    print("\nDone.\n")
+
+
+if __name__ == "__main__":
+    main()
