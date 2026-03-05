@@ -1,0 +1,2748 @@
+#!/usr/bin/env python3
+"""
+market_maker_v1.py – High-frequency spread-capture market maker for Polymarket
+hourly BTC up/down binary markets.
+
+Strategy
+--------
+- Simultaneously quote BUY orders on both YES (UP) and NO (DOWN) tokens.
+- Capture the spread: if both fill at combined cost < 1.00, guaranteed profit.
+- When BTC mid (from Binance bookTicker) moves adversely against one side,
+  cancel that side's resting order and ~250 ms later re-establish at an
+  appropriate level so that we are always quoting both sides.
+- Adapt the quoted spread based on realised BTC volatility (EMA of moves).
+- Track inventory and skew quotes to reduce position risk after partial fills.
+- Guard against stale data and auto-refresh long-resting orders.
+- Fair price model: Uses learned model (fair_up = p_up + β*ΔB + c) to anchor
+  quotes. When Binance moves and fair price changes, automatically cancels and
+  requotes at the new fair price level. This enables dynamic quote adjustment
+  based on predicted Polymarket moves from Binance price changes.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import math
+import os
+import ssl
+import time
+import urllib.error
+import urllib.request
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Optional, Tuple
+from zoneinfo import ZoneInfo
+
+import certifi
+import websockets
+
+from logger_v2 import SQLiteEventLogger, epoch_ns, iso_utc_from_epoch_ns
+
+# ── Fast JSON if available ───────────────────────────────────────────────────
+try:
+    import orjson as _orjson
+
+    def _json_loads(s):
+        return _orjson.loads(s)
+
+    def _json_dumps_str(d):
+        return _orjson.dumps(d, default=str).decode()
+except ImportError:
+    _orjson = None  # type: ignore[assignment]
+
+    def _json_loads(s):
+        return json.loads(s)
+
+    def _json_dumps_str(d):
+        return json.dumps(d, separators=(",", ":"), default=str)
+
+
+try:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client.order_builder.constants import BUY
+except Exception as e:
+    raise SystemExit(
+        "Missing py_clob_client. Activate venv and install py-clob-client."
+    ) from e
+
+# ── Constants ────────────────────────────────────────────────────────────────
+
+ET = ZoneInfo("America/New_York")
+GAMMA_BASE = "https://gamma-api.polymarket.com"
+POLY_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+BINANCE_WS_PRIMARY = "wss://stream.binance.com:9443/ws"
+BINANCE_WS_FALLBACK = "wss://data-stream.binance.vision/ws"
+BINANCE_SYMBOL = "btcusdt"
+
+SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+
+# ── Tiny helpers ─────────────────────────────────────────────────────────────
+
+
+def now_ns() -> int:
+    """Monotonic nanosecond clock – single call, no dict lookup overhead."""
+    return time.monotonic_ns()
+
+
+def jprint(d: dict[str, Any]) -> None:
+    print(_json_dumps_str(d), flush=True)
+
+
+def load_env_file(path: str) -> None:
+    p = Path(path).expanduser()
+    if not p.exists():
+        raise FileNotFoundError(f"env-file not found: {p}")
+    for raw in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        k, v = s.split("=", 1)
+        key = k.strip()
+        if not key or key in os.environ:
+            continue
+        vv = v.strip()
+        if len(vv) >= 2 and vv[0] == vv[-1] and vv[0] in ("'", '"'):
+            vv = vv[1:-1]
+        os.environ[key] = vv
+
+
+def parse_json_list(x: Any) -> list[Any]:
+    if isinstance(x, list):
+        return x
+    if isinstance(x, tuple):
+        return list(x)
+    if isinstance(x, str):
+        try:
+            y = json.loads(x)
+            if isinstance(y, list):
+                return y
+        except Exception:
+            return []
+    return []
+
+
+def hour_label(dt_et: datetime) -> str:
+    h = dt_et.hour
+    sfx = "am" if h < 12 else "pm"
+    h12 = h % 12
+    if h12 == 0:
+        h12 = 12
+    return f"{h12}{sfx}"
+
+
+def hourly_slug(dt_et: datetime) -> str:
+    d = dt_et.astimezone(ET).replace(minute=0, second=0, microsecond=0)
+    return f"bitcoin-up-or-down-{d.strftime('%B').lower()}-{d.day}-{hour_label(d)}-et"
+
+
+def http_json(url: str, timeout_sec: float) -> dict[str, Any]:
+    req = urllib.request.Request(
+        str(url),
+        headers={
+            "Accept": "application/json,text/plain,*/*",
+            "User-Agent": "poly-pair-mm/2.0",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=float(timeout_sec)) as r:
+        return json.loads(r.read().decode("utf-8", errors="replace"))
+
+
+def gamma_by_slug(slug: str, timeout_sec: float) -> dict[str, Any]:
+    url = f"{GAMMA_BASE}/markets/slug/{slug}"
+    try:
+        return http_json(url, timeout_sec)
+    except urllib.error.HTTPError as e:
+        if int(getattr(e, "code", 0)) == 404:
+            raise FileNotFoundError(slug) from e
+        raise
+
+
+def resolve_market_with_hour(
+    walk_hours: int, timeout_sec: float
+) -> tuple[str, dict[str, Any], datetime]:
+    """Return (slug, market_json, hour_start_et) for the first market found walking forward."""
+    base = datetime.now(ET).replace(minute=0, second=0, microsecond=0)
+    for i in range(max(1, int(walk_hours)) + 1):
+        cand = base + timedelta(hours=i)
+        slug = hourly_slug(cand)
+        try:
+            mk = gamma_by_slug(slug, timeout_sec)
+            return slug, mk, cand.replace(minute=0, second=0, microsecond=0)
+        except FileNotFoundError:
+            continue
+    raise FileNotFoundError("No hourly market found in forward walk")
+
+
+def extract_up_down_token_ids(market: dict[str, Any]) -> tuple[str, str]:
+    tids = parse_json_list(market.get("clobTokenIds"))
+    outs = [str(o).strip().lower() for o in parse_json_list(market.get("outcomes"))]
+    if len(tids) < 2:
+        raise RuntimeError("market missing clobTokenIds")
+    if len(outs) != len(tids):
+        return str(tids[0]), str(tids[1])
+    up_id = None
+    down_id = None
+    for o, t in zip(outs, tids):
+        if o in ("up", "yes", "true", "above"):
+            up_id = str(t)
+        elif o in ("down", "no", "false", "below"):
+            down_id = str(t)
+    if not up_id or not down_id:
+        up_id, down_id = str(tids[0]), str(tids[1])
+    return up_id, down_id
+
+
+def best_from_levels(levels: Any, is_bid: bool) -> Optional[float]:
+    best: Optional[float] = None
+    for lv in levels or []:
+        try:
+            p = float(lv.get("price")) if isinstance(lv, dict) else float(lv[0])
+        except Exception:
+            continue
+        if best is None:
+            best = p
+        elif is_bid and p > best:
+            best = p
+        elif (not is_bid) and p < best:
+            best = p
+    return best
+
+
+def normalize_price(px: float, pmin: float, pmax: float, tick: float) -> float:
+    x = max(float(pmin), min(float(pmax), float(px)))
+    q = round(x / float(tick))
+    out = q * float(tick)
+    out = max(float(pmin), min(float(pmax), out))
+    return float(f"{out:.6f}")
+
+
+def summarize(xs: list[float]) -> dict[str, Any]:
+    if not xs:
+        return {"n": 0}
+    xs2 = sorted(xs)
+
+    def pct(p: float) -> float:
+        i = int(round((p / 100.0) * (len(xs2) - 1)))
+        i = max(0, min(len(xs2) - 1, i))
+        return float(xs2[i])
+
+    return {
+        "n": len(xs2),
+        "min": float(xs2[0]),
+        "p50": pct(50),
+        "p90": pct(90),
+        "p99": pct(99),
+        "max": float(xs2[-1]),
+    }
+
+
+# ── Data structures ──────────────────────────────────────────────────────────
+
+
+@dataclass
+class BookTop:
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+    recv_ns: Optional[int] = None
+
+
+@dataclass
+class SideState:
+    name: str  # "UP" or "DOWN"
+    token_id: str
+    order_id: Optional[str] = None
+    px: Optional[float] = None
+    cancel_in_flight: bool = False
+    post_in_flight: bool = False  # True while a PostReq is queued / being processed
+    post_ns: Optional[int] = None  # when the order was posted (monotonic ns)
+    size_ordered: float = 0.0  # original order size (may differ from args.size after partials)
+    last_seen_matched: float = 0.0  # matched qty as of last fill-watcher poll
+
+
+@dataclass
+class CancelReq:
+    prio: int  # 0 = HI, 1 = LO
+    seq: int
+    t_enqueue_ns: int
+    t_trigger_ns: int
+    trigger_kind: str  # "BIN" | "FILL" | "REQUOTE" | "STALE" | "ROLLOVER" | "PARTIAL"
+    side: str  # "UP" | "DOWN"
+    order_id: str
+    replace_px: Optional[float] = None
+    replace_size: Optional[float] = None  # if set, replacement order uses this size instead of args.size
+    step_id: Optional[int] = None
+
+
+@dataclass
+class PostReq:
+    prio: int  # 0 = HI, 1 = LO
+    seq: int
+    t_enqueue_ns: int
+    trigger_ns: int
+    trigger_kind: str  # "BIN" | "FILL" | "REQUOTE" | "INIT" | "RISK_CLEAR" | "FILL_REPOST" | "PARTIAL_REPOST"
+    side: str  # "UP" | "DOWN"
+    token_id: str
+    px: float
+    size: float
+    step_id: Optional[int] = None
+
+
+# ── Volatility tracker ───────────────────────────────────────────────────────
+
+
+class VolatilityTracker:
+    """
+    EMA of absolute BTC mid-to-mid moves (per Binance tick).
+    Used to dynamically widen the quoted spread when the market is choppy.
+    """
+
+    __slots__ = ("_alpha", "_ema", "_last_mid", "min_vol", "max_vol")
+
+    def __init__(
+        self,
+        half_life_ticks: int = 50,
+        min_vol: float = 1.0,
+        max_vol: float = 200.0,
+    ):
+        self._alpha = 2.0 / (half_life_ticks + 1)
+        self._ema: Optional[float] = None
+        self._last_mid: Optional[float] = None
+        self.min_vol = min_vol
+        self.max_vol = max_vol
+
+    def update(self, mid: float) -> None:
+        if self._last_mid is not None:
+            abs_move = abs(mid - self._last_mid)
+            if self._ema is None:
+                self._ema = abs_move
+            else:
+                self._ema += self._alpha * (abs_move - self._ema)
+        self._last_mid = mid
+
+    @property
+    def ema(self) -> float:
+        if self._ema is None:
+            return self.min_vol
+        return max(self.min_vol, min(self.max_vol, self._ema))
+
+    def spread_multiplier(self, base_move_usd: float) -> float:
+        """
+        Returns a multiplier >= 1.0 that widens the spread when vol is elevated.
+        When EMA of moves equals *base_move_usd*, multiplier is 1.0.
+        """
+        if base_move_usd <= 0:
+            return 1.0
+        ratio = self.ema / base_move_usd
+        return max(1.0, ratio)
+
+
+# ── Client helpers ───────────────────────────────────────────────────────────
+
+
+def build_client_from_env() -> Tuple[ClobClient, str]:
+    key = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
+    if not key:
+        raise RuntimeError("POLYMARKET_PRIVATE_KEY missing")
+    host = os.environ.get(
+        "POLYMARKET_CLOB_HOST", "https://clob.polymarket.com"
+    ).strip()
+    chain = int(float(os.environ.get("POLYMARKET_CHAIN_ID", "137")))
+    funder = os.environ.get("POLYMARKET_PROXY", "").strip() or None
+    st_raw = os.environ.get("POLYMARKET_SIGNATURE_TYPE", "").strip()
+    signature_type = int(st_raw.lstrip("$")) if st_raw else (1 if funder else 0)
+    client = ClobClient(
+        host,
+        key=key,
+        chain_id=chain,
+        signature_type=signature_type,
+        funder=funder,
+    )
+    client.set_api_creds(client.create_or_derive_api_creds())
+    return client, host
+
+
+async def warmup_sign(
+    loop: asyncio.AbstractEventLoop,
+    sign_ex: ThreadPoolExecutor,
+    client: ClobClient,
+    token_id: str,
+) -> None:
+    """Pre-warm the signing path to eliminate first-call JIT / lazy-init penalty."""
+    try:
+        await loop.run_in_executor(
+            sign_ex,
+            client.create_order,
+            OrderArgs(price=0.50, size=1.0, side=BUY, token_id=str(token_id)),
+        )
+    except Exception:
+        pass
+
+
+async def post_postonly(
+    loop: asyncio.AbstractEventLoop,
+    sign_ex: ThreadPoolExecutor,
+    post_ex: ThreadPoolExecutor,
+    client: ClobClient,
+    *,
+    token_id: str,
+    px: float,
+    size: float,
+    live: bool,
+) -> tuple[str, float, dict[str, Any]]:
+    """Sign + post a BUY order with postOnly if supported.
+
+    Raises RuntimeError if the exchange rejects (e.g. crosses book).
+    """
+    t0 = time.perf_counter()
+
+    if not live:
+        return f"DRY_{uuid.uuid4().hex[:12]}", 0.0, {"mode": "DRY_RUN"}
+
+    signed = await loop.run_in_executor(
+        sign_ex,
+        client.create_order,
+        OrderArgs(
+            price=float(px),
+            size=float(size),
+            side=BUY,
+            token_id=str(token_id),
+        ),
+    )
+
+    def _post_call():
+        try:
+            return client.post_order(signed, OrderType.GTC, True)
+        except TypeError:
+            return client.post_order(signed, OrderType.GTC)
+
+    resp = await loop.run_in_executor(post_ex, _post_call)
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+
+    oid = None
+    out: dict[str, Any]
+    if isinstance(resp, dict):
+        oid = resp.get("orderID") or resp.get("orderId") or resp.get("id")
+        out = dict(resp)
+        # ── Detect exchange-level rejections returned as dicts ─────────
+        # The exchange may reject a post-only order that would cross the
+        # book and return the error in the response body without raising.
+        if not oid:
+            err_msg = str(
+                resp.get("errorMsg")
+                or resp.get("error")
+                or resp.get("message")
+                or ""
+            ).lower()
+            if err_msg:
+                raise RuntimeError(
+                    f"post_order rejected: {resp.get('errorMsg') or resp.get('error') or resp.get('message')}"
+                )
+    else:
+        out = {"response": str(resp)}
+
+    if not oid:
+        raise RuntimeError(f"post_order returned no order ID: {out}")
+
+    return str(oid), dt_ms, out
+
+
+async def cancel_one(
+    loop: asyncio.AbstractEventLoop,
+    cancel_ex: ThreadPoolExecutor,
+    client: ClobClient,
+    order_id: str,
+) -> float:
+    t0 = time.perf_counter()
+    await loop.run_in_executor(cancel_ex, client.cancel_orders, [str(order_id)])
+    return (time.perf_counter() - t0) * 1000.0
+
+
+async def get_order(
+    loop: asyncio.AbstractEventLoop,
+    read_ex: ThreadPoolExecutor,
+    client: ClobClient,
+    order_id: str,
+) -> Optional[dict[str, Any]]:
+    try:
+        resp = await loop.run_in_executor(read_ex, client.get_order, str(order_id))
+        return resp if isinstance(resp, dict) else None
+    except Exception:
+        return None
+
+
+def size_matched(order: Optional[dict[str, Any]]) -> float:
+    if not order:
+        return 0.0
+    sm = order.get("size_matched") or order.get("sizeMatched") or "0"
+    try:
+        return float(sm)
+    except Exception:
+        return 0.0
+
+
+# ── Main market-making loop ──────────────────────────────────────────────────
+
+
+async def run_one_market(
+    args: argparse.Namespace,
+    *,
+    slug: str,
+    up_id: str,
+    down_id: str,
+    hour_start_et: datetime,
+) -> None:
+    loop = asyncio.get_running_loop()
+
+    # Separate thread pools – extra workers so both sides can sign/post/cancel
+    # in parallel without head-of-line blocking.
+    sign_ex = ThreadPoolExecutor(max_workers=2)
+    post_ex = ThreadPoolExecutor(max_workers=2)
+    cancel_ex = ThreadPoolExecutor(max_workers=2)
+    read_ex = ThreadPoolExecutor(max_workers=1)
+
+    client, host = build_client_from_env()
+    jprint({
+        "event": "market_resolved",
+        "slug": slug,
+        "up_token": up_id,
+        "down_token": down_id,
+        "host": host,
+    })
+
+    # ── Warmup signing path for both tokens ──────────────────────────────
+    await asyncio.gather(
+        warmup_sign(loop, sign_ex, client, up_id),
+        warmup_sign(loop, sign_ex, client, down_id),
+    )
+    jprint({"event": "sign_warmup_done"})
+
+    # ── SQLite logger for RL training data ────────────────────────────────
+    run_id = uuid.uuid4().hex
+    args_json = _json_dumps_str({k: str(v) for k, v in vars(args).items()})
+    logger = SQLiteEventLogger(
+        str(args.db_path),
+        run_id=run_id,
+        max_queue=int(args.db_max_queue),
+        flush_every_ms=int(args.db_flush_ms),
+        log_binance_every_ms=int(args.db_log_binance_every_ms),
+        log_poly_every_ms=int(args.db_log_poly_every_ms),
+        args_json=args_json,
+    )
+
+    roll_et = hour_start_et + timedelta(hours=1)
+
+    logger.emit_market(
+        slug=slug,
+        up_token_id=up_id,
+        down_token_id=down_id,
+        hour_start_iso=hour_start_et.isoformat(),
+        roll_iso=roll_et.isoformat(),
+    )
+    # Wait for the writer thread to flush the market row
+    market_id = 0
+    for _ in range(60):
+        await asyncio.sleep(0.05)
+        market_id = logger.resolve_market_id(slug)
+        if market_id:
+            break
+    if not market_id:
+        jprint({"event": "db_market_id_missing", "slug": slug})
+        logger.close()
+        raise RuntimeError("Failed to resolve market_id; DB writer not flushing?")
+
+    jprint({"event": "db_logger_ready", "run_id": run_id, "market_id": market_id})
+
+    # ── Shared state ─────────────────────────────────────────────────────
+    book_up = BookTop()
+    book_dn = BookTop()
+    poly_ready = asyncio.Event()
+
+    bin_mid: Optional[float] = None
+    bin_ref: Optional[float] = None
+    bin_ready = asyncio.Event()
+    
+    # ── Fair price model (from backtest) ────────────────────────────────────
+    # Fair price: fair_up = p_up + β * ΔB(t) + c
+    # where ΔB(t) = B(t) - B(t-τ)
+    # Calibrated from mm_rl_log_BACKUP.sqlite (forward-looking, next-250ms):
+    #   poly_move_fwd(250ms) ≈ 0.000741 * ΔB_250ms - 0.000021
+    # Quadratic adds little; we keep a robust slope slightly rounded.
+    FAIR_TAU_MS = 250
+    FAIR_BETA = 0.00078
+    FAIR_CONST = -0.00005
+
+    # ── Adverse-selection guard (data-driven) ──────────────────────────────
+    # Empirically, fills are most toxic when Binance moves adversely by as
+    # little as ~$2-$10 over ~250ms. Because Poly prices are on a 1c tick grid,
+    # small model shifts don't always move quotes by a full tick; we therefore
+    # apply an extra tick buffer on the adverse side when |ΔB| is large enough.
+    #
+    # UP BUY is adverse when BTC moves DOWN (ΔB < 0).
+    # DOWN BUY is adverse when BTC moves UP (ΔB > 0).
+    ASEL_TRIGGER_USD = 2.0  # default; can be overridden by CLI
+    ASEL_BUCKETS_USD = (2.0, 5.0, 10.0)  # piecewise thresholds
+    ASEL_EXTRA_TICKS = (1, 2, 3)  # extra ticks to pull back on adverse side
+    # Binance price history: list of (time_ns, price) tuples, max 1000 entries
+    bin_history: list[tuple[int, float]] = []
+    MAX_BIN_HISTORY = 1000
+    last_fair_up: Optional[float] = None
+    last_fair_dn: Optional[float] = None
+
+    UP = SideState(name="UP", token_id=up_id)
+    DN = SideState(name="DOWN", token_id=down_id)
+
+    # Inventory: net units BOUGHT on each side (increases on fills)
+    inventory_up: float = 0.0
+    inventory_dn: float = 0.0
+
+    # Cancelled-order audit: when ANY code-path cancels an order we haven't
+    # fully fill-checked yet, save it here so fill_watcher can do one final
+    # get_order and credit any unaccounted partial fills to inventory.
+    #   order_id → (side_name, last_seen_matched_at_detach_time)
+    pending_fill_audit: dict[str, tuple[str, float]] = {}
+
+    # ── Post-only crossing backoff ─────────────────────────────────────
+    # When a post-only order is rejected ("crosses book"), the exchange's
+    # actual ask is AHEAD of our local WS-fed book.ask.  Rather than
+    # immediately retrying at the same stale price, we back off by extra
+    # ticks that increase on consecutive rejections and reset on success.
+    _MAX_CROSS_BACKOFF = 3          # max extra ticks of safety margin
+    _CROSS_BACKOFF_DECAY_NS = int(5e9)  # auto-decay backoff after 5s
+    cross_backoff_up: int = 0       # extra ticks for UP side
+    cross_backoff_dn: int = 0       # extra ticks for DOWN side
+    cross_backoff_last_ns_up: int = 0  # last rejection timestamp (UP)
+    cross_backoff_last_ns_dn: int = 0  # last rejection timestamp (DOWN)
+
+    def detach_order_for_audit(S: SideState) -> Optional[str]:
+        """Detach the active order from *S* and save for fill audit.
+        Returns the old order_id (or None)."""
+        oid = S.order_id
+        if oid is not None:
+            pending_fill_audit[oid] = (S.name, S.last_seen_matched)
+        S.order_id = None
+        S.px = None
+        S.post_ns = None
+        S.size_ordered = 0.0
+        S.last_seen_matched = 0.0
+        S.post_in_flight = False
+        return oid
+
+    def clear_order_no_audit(S: SideState) -> None:
+        """Clear order fields without auditing (fills already accounted for)."""
+        S.order_id = None
+        S.px = None
+        S.post_ns = None
+        S.size_ordered = 0.0
+        S.last_seen_matched = 0.0
+        S.post_in_flight = False
+
+    # Volatility tracker
+    vol_tracker = VolatilityTracker(
+        half_life_ticks=int(args.vol_half_life),
+        min_vol=1.0,
+        max_vol=200.0,
+    )
+
+    # ── RL step counter ───────────────────────────────────────────────────
+    step_counter = 0
+    current_step_id: Optional[int] = None
+
+    def _book_age_ms(bk: BookTop) -> Optional[float]:
+        if bk.recv_ns is None:
+            return None
+        return (now_ns() - int(bk.recv_ns)) / 1e6
+
+    def log_step(
+        reason: str,
+        *,
+        action_id: int = 0,
+        action: Optional[dict[str, Any]] = None,
+        extra_state: Optional[dict[str, Any]] = None,
+    ) -> int:
+        """Record a decision snapshot and return the new step_id.
+
+        SAFETY: this function must NEVER raise.  If the logger or JSON
+        serialisation fails, we still increment and return the step_id so
+        that order tracking continues to work correctly.
+        """
+        nonlocal step_counter, current_step_id
+        step_counter += 1
+        sid = step_counter
+        current_step_id = sid
+
+        try:
+            up_mid = (0.5 * (book_up.bid + book_up.ask)) if (book_up.bid is not None and book_up.ask is not None) else None
+            dn_mid = (0.5 * (book_dn.bid + book_dn.ask)) if (book_dn.bid is not None and book_dn.ask is not None) else None
+
+            state: dict[str, Any] = {
+                "time": {
+                    "epoch_ns": epoch_ns(),
+                    "mono_ns": now_ns(),
+                    "secs_left": (roll_et - datetime.now(ET)).total_seconds(),
+                    "roll_et": roll_et.isoformat(),
+                },
+                "binance": {
+                    "mid": bin_mid,
+                    "ref": bin_ref,
+                    "move": (float(bin_mid) - float(bin_ref)) if (bin_mid is not None and bin_ref is not None) else None,
+                    "vol_ema_usd": vol_tracker.ema,
+                },
+                "poly": {
+                    "UP": {
+                        "bid": book_up.bid, "ask": book_up.ask, "mid": up_mid,
+                        "spread": (book_up.ask - book_up.bid) if (book_up.bid is not None and book_up.ask is not None) else None,
+                        "age_ms": _book_age_ms(book_up),
+                    },
+                    "DOWN": {
+                        "bid": book_dn.bid, "ask": book_dn.ask, "mid": dn_mid,
+                        "spread": (book_dn.ask - book_dn.bid) if (book_dn.bid is not None and book_dn.ask is not None) else None,
+                        "age_ms": _book_age_ms(book_dn),
+                    },
+                },
+                "inventory": {
+                    "up": inventory_up,
+                    "down": inventory_dn,
+                    "imbalance": inventory_up - inventory_dn,
+                },
+                "orders": {
+                    "UP": {
+                        "oid": UP.order_id, "px": UP.px,
+                        "size_ordered": UP.size_ordered,
+                        "last_seen_matched": UP.last_seen_matched,
+                    },
+                    "DOWN": {
+                        "oid": DN.order_id, "px": DN.px,
+                        "size_ordered": DN.size_ordered,
+                        "last_seen_matched": DN.last_seen_matched,
+                    },
+                },
+                "risk": {
+                    "risk_active": risk_active,
+                    "risk_dir": risk_dir,
+                    "risk_until_ns": risk_until_ns,
+                },
+            }
+            if extra_state:
+                state["extra"] = extra_state
+
+            action_dict = action if action is not None else {}
+
+            logger.emit_step(
+                market_id=market_id,
+                step_id=sid,
+                reason=reason,
+                action_id=action_id,
+                action_json=action_dict,
+                state_json=state,
+            )
+        except Exception:
+            pass  # emit_step already counts drops; never crash the trading loop
+
+        return sid
+
+    # ── Action menu (minimal 12-action grid for RL exploration) ────────
+    ACTION_MENU_VERSION = 2
+    ACTION_MID_OFFSET_TICKS = [0.0, 0.5, 1.0]
+    ACTION_ASK_BUFFER_TICKS = [0.0, 0.5, 1.0, 2.0]
+
+    ACTION_MENU: list[dict[str, float]] = []
+    for _mo in ACTION_MID_OFFSET_TICKS:
+        for _ab in ACTION_ASK_BUFFER_TICKS:
+            ACTION_MENU.append({
+                "mid_offset_ticks": _mo,
+                "ask_buffer_ticks": _ab,
+            })
+    # ACTION_MENU[0] = {mid_offset_ticks: 0.0, ask_buffer_ticks: 0.0}  ... [11]
+
+    def _float_close(a: float, b: float, tol: float = 1e-9) -> bool:
+        return abs(a - b) < tol
+
+    def action_id_from_knobs(mo: float, ab: float) -> int:
+        """Reverse-lookup: current knobs → menu index, or -1 if off-menu."""
+        for i, entry in enumerate(ACTION_MENU):
+            if _float_close(entry["mid_offset_ticks"], mo) and _float_close(entry["ask_buffer_ticks"], ab):
+                return i
+        return -1
+
+    # Effective overrides (start with CLI defaults)
+    eff_mid_offset_ticks: float = float(args.mid_offset_ticks)
+    eff_ask_buffer_ticks: float = float(args.ask_buffer_ticks)
+    last_action_id: int = action_id_from_knobs(eff_mid_offset_ticks, eff_ask_buffer_ticks)
+    last_action_params: dict[str, Any] = {
+        "mid_offset_ticks": eff_mid_offset_ticks,
+        "ask_buffer_ticks": eff_ask_buffer_ticks,
+    }
+
+    def apply_action(aid: int) -> None:
+        """Set the effective quoting knobs from the action menu."""
+        nonlocal eff_mid_offset_ticks, eff_ask_buffer_ticks
+        nonlocal last_action_id, last_action_params
+        if 0 <= aid < len(ACTION_MENU):
+            entry = ACTION_MENU[aid]
+            eff_mid_offset_ticks = entry["mid_offset_ticks"]
+            eff_ask_buffer_ticks = entry["ask_buffer_ticks"]
+            last_action_id = aid
+            last_action_params = dict(entry)
+        else:
+            last_action_id = aid
+            last_action_params = {
+                "mid_offset_ticks": eff_mid_offset_ticks,
+                "ask_buffer_ticks": eff_ask_buffer_ticks,
+            }
+
+    def choose_action_id() -> int:
+        """Select an action id. For now, use the CLI override or default 0."""
+        forced = int(getattr(args, "policy_action_id", -1))
+        if 0 <= forced < len(ACTION_MENU):
+            return forced
+        # Default: map current CLI knobs to action id (or 0)
+        aid = action_id_from_knobs(float(args.mid_offset_ticks), float(args.ask_buffer_ticks))
+        return aid if aid >= 0 else 0
+
+    # Priority queues
+    cancel_q: asyncio.PriorityQueue[tuple[int, int, CancelReq]] = (
+        asyncio.PriorityQueue()
+    )
+    post_q: asyncio.PriorityQueue[tuple[int, int, PostReq]] = (
+        asyncio.PriorityQueue()
+    )
+    seq = 0
+
+    # Metrics
+    post_ms_list: list[float] = []
+    cancel_ms_list: list[float] = []
+    cancel_queue_ms_list: list[float] = []
+    trigger_to_cancel_ms_list: list[float] = []
+    trigger_to_replace_ms_list: list[float] = []
+    fills_up = 0
+    fills_dn = 0
+
+    shutdown = asyncio.Event()
+    requote_event = asyncio.Event()  # signalled for immediate requote
+
+    # Risk window
+    risk_active = False
+    risk_dir: Optional[str] = None
+    risk_until_ns: Optional[int] = None
+    last_risk_trigger_ns: Optional[int] = None
+
+    roll_et = hour_start_et + timedelta(hours=1)
+
+    # ── Pricing helpers ──────────────────────────────────────────────────
+
+    def poly_ok() -> bool:
+        return (
+            book_up.bid is not None
+            and book_up.ask is not None
+            and book_dn.bid is not None
+            and book_dn.ask is not None
+        )
+
+    def book_is_stale(max_age_ms: float) -> bool:
+        """Return True if either Poly book is older than *max_age_ms*."""
+        t = now_ns()
+        for bk in (book_up, book_dn):
+            if bk.recv_ns is None:
+                return True
+            if (t - bk.recv_ns) / 1e6 > max_age_ms:
+                return True
+        return False
+
+    def inventory_skew_ticks() -> tuple[float, float]:
+        """
+        Per-side skew in ticks based on NET inventory imbalance.
+        Only the OVERWEIGHT side gets pulled back; the wanted side
+        has zero skew so it stays aggressive to rebalance.
+
+        imbalance > 0  →  long UP  →  pull UP back, leave DOWN alone
+        imbalance < 0  →  long DOWN →  pull DOWN back, leave UP alone
+        imbalance == 0 →  balanced  →  no skew on either side
+        """
+        s = float(args.inventory_skew_ticks)
+        imbalance = inventory_up - inventory_dn
+        up_skew = max(0.0, imbalance) * s   # pull back UP when long UP
+        dn_skew = max(0.0, -imbalance) * s  # pull back DOWN when long DOWN
+        return up_skew, dn_skew
+
+    def vol_spread_extra_ticks() -> float:
+        """Extra offset ticks to add to each side when vol is elevated."""
+        mult = vol_tracker.spread_multiplier(float(args.bin_move_usd))
+        # mult >= 1.0; extra = (mult - 1) * scale, capped
+        raw = (mult - 1.0) * float(args.vol_spread_scale)
+        cap = float(args.vol_spread_max_ticks)
+        return min(raw, cap) if cap > 0 else raw
+
+    # Polymarket minimum order notional ($1).
+    _POLY_MIN_NOTIONAL = 1.0
+
+    def _notional_ok(px: float, sz: float) -> bool:
+        """True if px * sz >= Polymarket minimum ($1)."""
+        return px * sz >= _POLY_MIN_NOTIONAL - 1e-9
+
+    def get_bin_move_usd(t_ns: int) -> Optional[float]:
+        """Compute ΔB(t) = B(t) - B(t-τ) for fair price model.
+        
+        Returns None if insufficient history.
+        """
+        if bin_mid is None:
+            return None
+        
+        tau_ns = int(FAIR_TAU_MS * 1e6)
+        t_lag = t_ns - tau_ns
+        
+        # Find B(t-τ) using backward search
+        b_lag = None
+        for hist_t, hist_p in reversed(bin_history):
+            if hist_t <= t_lag:
+                b_lag = hist_p
+                break
+        
+        if b_lag is None:
+            return None
+        
+        return float(bin_mid) - b_lag
+
+    def adverse_selection_extra_ticks(side_name: str, bin_move_usd: float) -> int:
+        """Extra ticks to pull back on the adverse side, based on |ΔB|.
+
+        Data from the backup log shows mean 250ms markout turns negative for:
+        - UP fills when ΔB_250ms is negative with magnitude >= ~$2-$5
+        - DOWN fills when ΔB_250ms is positive with magnitude >= ~$2-$5
+        """
+        # Determine adverse magnitude for this side
+        if side_name == "UP":
+            adv = max(0.0, -float(bin_move_usd))
+        else:
+            adv = max(0.0, float(bin_move_usd))
+
+        b0, b1, b2 = ASEL_BUCKETS_USD
+        t0, t1, t2 = ASEL_EXTRA_TICKS
+        if adv >= b2:
+            return int(t2)
+        if adv >= b1:
+            return int(t1)
+        if adv >= b0:
+            return int(t0)
+        return 0
+    
+    def compute_fair_prices(t_ns: int) -> Optional[tuple[float, float]]:
+        """Compute fair UP and DOWN prices using the model.
+        
+        Returns (fair_up, fair_dn) or None if insufficient data.
+        """
+        if not poly_ok() or bin_mid is None:
+            return None
+        
+        # Get current Poly mid
+        p_up_mid = (float(book_up.bid) + float(book_up.ask)) / 2.0  # type: ignore[arg-type]
+        p_dn_mid = (float(book_dn.bid) + float(book_dn.ask)) / 2.0  # type: ignore[arg-type]
+        
+        # Get Binance move
+        bin_move = get_bin_move_usd(t_ns)
+        if bin_move is None:
+            return None
+        
+        # Compute fair prices: fair_up = p_up + β * ΔB + c
+        tick = float(args.tick)
+        pmin = float(args.price_min)
+        pmax = float(args.price_max)
+        
+        fair_up_raw = p_up_mid + FAIR_BETA * bin_move + FAIR_CONST
+        fair_up = max(pmin, min(pmax, fair_up_raw))
+        fair_up = normalize_price(fair_up, args.price_min, args.price_max, tick)
+        
+        # Fair DOWN = 1 - fair_up (binary complement approximation)
+        fair_dn_raw = 1.0 - fair_up
+        fair_dn = max(pmin, min(pmax, fair_dn_raw))
+        fair_dn = normalize_price(fair_dn, args.price_min, args.price_max, tick)
+        
+        return fair_up, fair_dn
+    
+    def compute_pair_px() -> Optional[tuple[float, float]]:
+        """Compute desired BUY prices for UP and DOWN tokens.
+
+        Anchor: best ask minus 1 tick (tightest maker price).
+        Offsets pull back from there.
+        Sum constraint: inventory-weighted — the OVERWEIGHT side absorbs
+        more of the excess so the WANTED side stays near its ask.
+        """
+        if not poly_ok():
+            return None
+        tick = float(args.tick)
+        pmin = float(args.price_min)
+
+        # ── Maker ceiling: 1 tick below the ask (a BUY at the ask crosses) ─
+        # Also include crossing-backoff ticks so that after a post-only
+        # rejection we automatically pull back further on the next attempt.
+        t_now_bo = now_ns()
+        nonlocal cross_backoff_up, cross_backoff_dn, cross_backoff_last_ns_up, cross_backoff_last_ns_dn
+        # Auto-decay backoff after 5 s of no rejections
+        if cross_backoff_up > 0 and (t_now_bo - cross_backoff_last_ns_up) > _CROSS_BACKOFF_DECAY_NS:
+            cross_backoff_up = 0
+        if cross_backoff_dn > 0 and (t_now_bo - cross_backoff_last_ns_dn) > _CROSS_BACKOFF_DECAY_NS:
+            cross_backoff_dn = 0
+        up_ceil = float(book_up.ask) - tick - cross_backoff_up * tick  # type: ignore[arg-type]
+        dn_ceil = float(book_dn.ask) - tick - cross_backoff_dn * tick  # type: ignore[arg-type]
+
+        # ── Compute fair prices (if available) ─────────────────────────
+        t_now = now_ns()
+        fair_prices = compute_fair_prices(t_now)
+        fair_up_val = None
+        fair_dn_val = None
+        if fair_prices is not None:
+            fair_up_val, fair_dn_val = fair_prices
+        
+        # ── Start from maker ceiling or fair price (whichever is tighter) ──
+        ask_buf  = float(eff_ask_buffer_ticks) * tick
+        base_off = float(eff_mid_offset_ticks) * tick
+        vol_extra = vol_spread_extra_ticks() * tick
+        up_skew_t, dn_skew_t = inventory_skew_ticks()
+        
+        # Use fair price as anchor if available, otherwise use ask ceiling
+        if fair_up_val is not None:
+            # Anchor to min(ask - buffer, fair - edge)
+            edge = base_off  # Use mid_offset as the edge buffer
+            px_up_base = min(up_ceil - ask_buf, fair_up_val - edge)
+        else:
+            px_up_base = up_ceil - ask_buf - base_off
+        
+        if fair_dn_val is not None:
+            edge = base_off
+            px_dn_base = min(dn_ceil - ask_buf, fair_dn_val - edge)
+        else:
+            px_dn_base = dn_ceil - ask_buf - base_off
+
+        # ── Adverse-selection guard: pull back adverse side by extra ticks ──
+        bin_move = get_bin_move_usd(t_now)
+        extra_up = 0
+        extra_dn = 0
+        if bin_move is not None:
+            trig = float(getattr(args, "asel_trigger_usd", ASEL_TRIGGER_USD))
+            if abs(float(bin_move)) >= trig:
+                extra_up = adverse_selection_extra_ticks("UP", float(bin_move))
+                extra_dn = adverse_selection_extra_ticks("DOWN", float(bin_move))
+
+        px_up_base -= float(extra_up) * tick
+        px_dn_base -= float(extra_dn) * tick
+        
+        px_up = px_up_base - vol_extra - up_skew_t * tick
+        px_dn = px_dn_base - vol_extra - dn_skew_t * tick
+
+        # Clamp into [price_min, ceiling]
+        px_up = max(pmin, min(px_up, up_ceil))
+        px_dn = max(pmin, min(px_dn, dn_ceil))
+
+        px_up = normalize_price(px_up, args.price_min, args.price_max, tick)
+        px_dn = normalize_price(px_dn, args.price_min, args.price_max, tick)
+
+        # ── Enforce sum constraint ─────────────────────────────────────
+        # Weights use NET imbalance — only the overweight side absorbs
+        # excess; the wanted side stays as aggressive as possible.
+        target = float(args.sum_target)
+        total = px_up + px_dn
+
+        imbalance = inventory_up - inventory_dn
+        net_up = max(0.0, imbalance)   # excess UP tokens
+        net_dn = max(0.0, -imbalance)  # excess DOWN tokens
+        total_net = net_up + net_dn    # = abs(imbalance)
+
+        if total > target + 1e-9:
+            # Over target — push prices down.
+            # The overweight side absorbs MORE of the reduction.
+            excess = total - target
+
+            if total_net > 1e-9:
+                up_share = net_up / total_net
+                dn_share = net_dn / total_net
+            else:
+                # Balanced → proportional by price
+                up_share = px_up / total if total > 1e-12 else 0.5
+                dn_share = px_dn / total if total > 1e-12 else 0.5
+
+            raw_up = px_up - excess * up_share
+            raw_dn = px_dn - excess * dn_share
+
+            # Clamp to price_min; if one side hits floor, shift
+            # remaining excess to the other side.
+            raw_up = max(pmin, raw_up)
+            raw_dn = max(pmin, raw_dn)
+            still_over = (raw_up + raw_dn) - target
+            if still_over > 1e-9:
+                # One side hit floor, give remainder to the other
+                if raw_up > pmin + 1e-9:
+                    raw_up = max(pmin, raw_up - still_over)
+                elif raw_dn > pmin + 1e-9:
+                    raw_dn = max(pmin, raw_dn - still_over)
+
+            px_up = normalize_price(raw_up, args.price_min, args.price_max, tick)
+            px_dn = normalize_price(raw_dn, args.price_min, args.price_max, tick)
+
+            # Rounding may leave us 1 tick over – trim the overweight side
+            if px_up + px_dn > target + 1e-9:
+                if net_up > net_dn or (
+                    abs(net_up - net_dn) < 1e-9 and px_up >= px_dn
+                ):
+                    px_up = normalize_price(
+                        px_up - tick, args.price_min, args.price_max, tick
+                    )
+                else:
+                    px_dn = normalize_price(
+                        px_dn - tick, args.price_min, args.price_max, tick
+                    )
+
+        elif total < target - 1e-9:
+            # Under target — boost prices up.
+            # The WANTED side (less inventory) gets more boost.
+            shortfall = target - total
+
+            if total_net > 1e-9:
+                # Inverse: wanted side gets all the boost
+                up_boost = net_dn / total_net   # UP boost ∝ excess DOWN
+                dn_boost = net_up / total_net   # DOWN boost ∝ excess UP
+            else:
+                up_boost = px_up / total if total > 1e-12 else 0.5
+                dn_boost = px_dn / total if total > 1e-12 else 0.5
+
+            raw_up = px_up + shortfall * up_boost
+            raw_dn = px_dn + shortfall * dn_boost
+
+            # Cap at ceiling (never cross the book).
+            # Do NOT redistribute leftover — if the wanted side is already
+            # at its ceiling and can't absorb the boost, the remainder is
+            # simply lost.  Pushing it onto the overweight side would undo
+            # the inventory skew (the exact bug we're preventing).
+            raw_up = min(raw_up, up_ceil)
+            raw_dn = min(raw_dn, dn_ceil)
+
+            px_up = normalize_price(raw_up, args.price_min, args.price_max, tick)
+            px_dn = normalize_price(raw_dn, args.price_min, args.price_max, tick)
+
+            # Rounding may push us back over – final safety trim
+            if px_up + px_dn > target + 1e-9:
+                if px_up >= px_dn:
+                    px_up = normalize_price(
+                        px_up - tick, args.price_min, args.price_max, tick
+                    )
+                else:
+                    px_dn = normalize_price(
+                        px_dn - tick, args.price_min, args.price_max, tick
+                    )
+
+        return px_up, px_dn
+
+    def risk_replace_px(side: str, base_up: float, base_dn: float) -> float:
+        tick = float(args.tick)
+        extra = float(args.risk_extra_ticks) * tick
+        if side == "UP":
+            return normalize_price(
+                base_up - extra, args.price_min, args.price_max, tick
+            )
+        return normalize_price(
+            base_dn - extra, args.price_min, args.price_max, tick
+        )
+
+    # ── Queue helpers ────────────────────────────────────────────────────
+
+    def enqueue_cancel(
+        *,
+        prio: int,
+        trigger_kind: str,
+        side: str,
+        oid: str,
+        trigger_ns: int,
+        replace_px: Optional[float],
+        replace_size: Optional[float] = None,
+        step_id: Optional[int] = None,
+    ) -> None:
+        nonlocal seq
+        seq += 1
+        req = CancelReq(
+            prio=prio,
+            seq=seq,
+            t_enqueue_ns=now_ns(),
+            t_trigger_ns=int(trigger_ns),
+            trigger_kind=trigger_kind,
+            side=side,
+            order_id=oid,
+            replace_px=replace_px,
+            replace_size=replace_size,
+            step_id=step_id,
+        )
+        cancel_q.put_nowait((req.prio, req.seq, req))
+        logger.emit_order_event(
+            market_id=market_id,
+            step_id=step_id,
+            kind="enqueue_cancel",
+            side=side,
+            order_id=oid,
+            px=replace_px,
+            size=replace_size,
+            trigger_kind=trigger_kind,
+            trigger_ns=int(trigger_ns),
+            enqueue_ns=req.t_enqueue_ns,
+            latency_ms=None,
+            queue_ms=None,
+            ok=None,
+            payload={"replace_px": replace_px, "replace_size": replace_size},
+        )
+
+    def enqueue_post(
+        *,
+        prio: int,
+        trigger_kind: str,
+        side: str,
+        token_id: str,
+        px: float,
+        trigger_ns: int,
+        size: Optional[float] = None,
+        step_id: Optional[int] = None,
+    ) -> None:
+        nonlocal seq
+        S = UP if side == "UP" else DN
+        S.post_in_flight = True  # prevent duplicate enqueues until post_worker clears
+        seq += 1
+        req = PostReq(
+            prio=prio,
+            seq=seq,
+            t_enqueue_ns=now_ns(),
+            trigger_ns=int(trigger_ns),
+            trigger_kind=trigger_kind,
+            side=side,
+            token_id=token_id,
+            px=float(px),
+            size=float(size) if size is not None else float(args.size),
+            step_id=step_id,
+        )
+        post_q.put_nowait((req.prio, req.seq, req))
+        logger.emit_order_event(
+            market_id=market_id,
+            step_id=step_id,
+            kind="enqueue_post",
+            side=side,
+            order_id=None,
+            px=float(px),
+            size=float(req.size),
+            trigger_kind=trigger_kind,
+            trigger_ns=int(trigger_ns),
+            enqueue_ns=req.t_enqueue_ns,
+            latency_ms=None,
+            queue_ms=None,
+            ok=None,
+            payload={"token_id": token_id},
+        )
+
+    # ── Cancel worker (2 instances for parallelism) ──────────────────────
+
+    async def cancel_worker() -> None:
+        while not shutdown.is_set():
+            try:
+                _, _, req = await asyncio.wait_for(cancel_q.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+
+            t_start = now_ns()
+            q_ms = (t_start - req.t_enqueue_ns) / 1e6
+            cancel_queue_ms_list.append(q_ms)
+
+            S = UP if req.side == "UP" else DN
+            cancel_ok = False
+
+            try:
+                ms = await cancel_one(loop, cancel_ex, client, req.order_id)
+                cancel_ms_list.append(ms)
+                trigger_to_cancel_ms_list.append(
+                    (now_ns() - req.t_trigger_ns) / 1e6
+                )
+                cancel_ok = True
+
+                jprint({
+                    "event": "cancel_done",
+                    "side": req.side,
+                    "oid": req.order_id,
+                    "prio": "HI" if req.prio == 0 else "LO",
+                    "trigger_kind": req.trigger_kind,
+                    "cancel_ms": ms,
+                    "queue_ms": cancel_queue_ms_list[-1],
+                    "trigger_to_cancel_ms": trigger_to_cancel_ms_list[-1],
+                })
+                logger.emit_order_event(
+                    market_id=market_id,
+                    step_id=req.step_id,
+                    kind="cancel_done",
+                    side=req.side,
+                    order_id=req.order_id,
+                    px=req.replace_px,
+                    size=req.replace_size,
+                    trigger_kind=req.trigger_kind,
+                    trigger_ns=req.t_trigger_ns,
+                    enqueue_ns=req.t_enqueue_ns,
+                    latency_ms=ms,
+                    queue_ms=q_ms,
+                    ok=True,
+                    payload={
+                        "trigger_to_cancel_ms": trigger_to_cancel_ms_list[-1]
+                        if trigger_to_cancel_ms_list else None,
+                    },
+                )
+            except Exception as e:
+                jprint({
+                    "event": "cancel_error",
+                    "side": req.side,
+                    "oid": req.order_id,
+                    "err": str(e),
+                })
+                logger.emit_order_event(
+                    market_id=market_id,
+                    step_id=req.step_id,
+                    kind="cancel_error",
+                    side=req.side,
+                    order_id=req.order_id,
+                    px=req.replace_px,
+                    size=req.replace_size,
+                    trigger_kind=req.trigger_kind,
+                    trigger_ns=req.t_trigger_ns,
+                    enqueue_ns=req.t_enqueue_ns,
+                    latency_ms=None,
+                    queue_ms=q_ms,
+                    ok=False,
+                    payload={"err": str(e)},
+                )
+
+            if not cancel_ok:
+                # Cancel may not have gone through — old order could still be
+                # live on the exchange.  Restore tracking so we don't orphan it
+                # and let quote_manager retry on the next cycle.
+                if S.order_id is None and not S.post_in_flight:
+                    S.order_id = req.order_id
+                    # Remove from audit — we're restoring, not abandoning
+                    pending_fill_audit.pop(req.order_id, None)
+                S.cancel_in_flight = False
+                jprint({
+                    "event": "cancel_restore",
+                    "side": req.side,
+                    "oid": req.order_id,
+                })
+                continue  # do NOT post replacement
+
+            S.cancel_in_flight = False
+
+            # Schedule replacement on post lane (so cancels can't be blocked
+            # by a slow post).
+            repl_size = req.replace_size if req.replace_size is not None else float(args.size)
+            if req.replace_px is not None and _notional_ok(float(req.replace_px), repl_size):
+                enqueue_post(
+                    prio=0,
+                    trigger_kind=req.trigger_kind,
+                    side=req.side,
+                    token_id=S.token_id,
+                    px=float(req.replace_px),
+                    trigger_ns=req.t_trigger_ns,
+                    size=req.replace_size,  # None → default (args.size); set for partials
+                    step_id=req.step_id,
+                )
+            else:
+                # No replace price or notional too low → signal requote so
+                # quote_manager re-posts immediately with fresh prices.
+                requote_event.set()
+
+    # ── Post worker (2 instances for parallelism) ────────────────────────
+
+    async def post_worker() -> None:
+        nonlocal cross_backoff_up, cross_backoff_dn
+        nonlocal cross_backoff_last_ns_up, cross_backoff_last_ns_dn
+        while not shutdown.is_set():
+            try:
+                _, _, req = await asyncio.wait_for(post_q.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+
+            S = UP if req.side == "UP" else DN
+
+            # ── Duplicate guard: another post for this side already landed ──
+            if S.order_id is not None:
+                S.post_in_flight = False
+                jprint({
+                    "event": "post_skipped_dup",
+                    "side": req.side,
+                    "existing_oid": S.order_id,
+                    "trigger_kind": req.trigger_kind,
+                })
+                logger.emit_order_event(
+                    market_id=market_id, step_id=req.step_id,
+                    kind="post_skip_dup", side=req.side, order_id=S.order_id,
+                    px=req.px, size=req.size,
+                    trigger_kind=req.trigger_kind, trigger_ns=req.trigger_ns,
+                    enqueue_ns=req.t_enqueue_ns, latency_ms=None, queue_ms=None,
+                    ok=False, payload={"existing_oid": S.order_id},
+                )
+                continue
+
+            # ── Stale-data guard: skip post if book data is too old ─────────
+            if book_is_stale(float(args.stale_book_ms)):
+                S.post_in_flight = False
+                jprint({
+                    "event": "post_skipped_stale_book",
+                    "side": req.side,
+                    "trigger_kind": req.trigger_kind,
+                })
+                logger.emit_order_event(
+                    market_id=market_id, step_id=req.step_id,
+                    kind="post_skip_stale_book", side=req.side, order_id=None,
+                    px=req.px, size=req.size,
+                    trigger_kind=req.trigger_kind, trigger_ns=req.trigger_ns,
+                    enqueue_ns=req.t_enqueue_ns, latency_ms=None, queue_ms=None,
+                    ok=False, payload={},
+                )
+                continue
+
+            # ── BIN-specific: skip if risk still active ─────────────────
+            actual_px = req.px
+            if req.trigger_kind == "BIN" and risk_active:
+                S.post_in_flight = False
+                jprint({
+                    "event": "post_skipped_risk_active",
+                    "side": req.side,
+                    "trigger_kind": req.trigger_kind,
+                    "original_px": req.px,
+                    "risk_dir": risk_dir,
+                })
+                logger.emit_order_event(
+                    market_id=market_id, step_id=req.step_id,
+                    kind="post_skip_risk_active", side=req.side,
+                    order_id=None, px=req.px, size=req.size,
+                    trigger_kind=req.trigger_kind, trigger_ns=req.trigger_ns,
+                    enqueue_ns=req.t_enqueue_ns, latency_ms=None,
+                    queue_ms=None, ok=False,
+                    payload={"risk_dir": risk_dir, "bin_mid": bin_mid},
+                )
+                requote_event.set()
+                continue
+
+            # ── Fresh-price re-check (ALL trigger kinds) ─────────────
+            # Between cancel-enqueue and now the market may have moved.
+            # Recompute and use the more conservative (lower BUY) of
+            # original and fresh to avoid quoting into an adverse move
+            # or crossing the book.
+            q = compute_pair_px()
+            if q is not None:
+                fresh_up, fresh_dn = q
+                fresh_px = fresh_up if req.side == "UP" else fresh_dn
+                prev_actual = actual_px
+                actual_px = min(actual_px, fresh_px)
+                actual_px = normalize_price(
+                    actual_px, args.price_min, args.price_max,
+                    float(args.tick),
+                )
+                if abs(actual_px - prev_actual) > 1e-9:
+                    jprint({
+                        "event": "post_repriced_fresh",
+                        "side": req.side,
+                        "trigger_kind": req.trigger_kind,
+                        "original_px": prev_actual,
+                        "fresh_px": fresh_px,
+                        "actual_px": actual_px,
+                    })
+
+            # ── Pre-flight guards: crossing & notional ─────────────────
+            book = book_up if req.side == "UP" else book_dn
+            best_ask = float(book.ask) if book.ask is not None else None  # type: ignore[arg-type]
+            tick = float(args.tick)
+            # Include the crossing-backoff so consecutive rejects pull
+            # further away from the stale ask we see locally.
+            bo = cross_backoff_up if req.side == "UP" else cross_backoff_dn
+            safety_ticks = 1 + bo  # 1 base + backoff
+
+            if best_ask is not None and actual_px >= best_ask - safety_ticks * tick + 1e-9:
+                # Would cross or sit too close to the ask → clamp
+                actual_px = normalize_price(
+                    best_ask - safety_ticks * tick, args.price_min, args.price_max, tick
+                )
+
+            notional = actual_px * req.size
+            if notional < _POLY_MIN_NOTIONAL - 1e-9:
+                S.post_in_flight = False
+                jprint({
+                    "event": "post_skipped_low_notional",
+                    "side": req.side,
+                    "px": actual_px,
+                    "size": req.size,
+                    "notional": notional,
+                    "trigger_kind": req.trigger_kind,
+                })
+                logger.emit_order_event(
+                    market_id=market_id, step_id=req.step_id,
+                    kind="post_skip_low_notional", side=req.side,
+                    order_id=None, px=actual_px, size=req.size,
+                    trigger_kind=req.trigger_kind, trigger_ns=req.trigger_ns,
+                    enqueue_ns=req.t_enqueue_ns, latency_ms=None,
+                    queue_ms=None, ok=False,
+                    payload={"notional": notional},
+                )
+                continue
+
+            try:
+                oid, ms, resp = await post_postonly(
+                    loop,
+                    sign_ex,
+                    post_ex,
+                    client,
+                    token_id=req.token_id,
+                    px=actual_px,
+                    size=req.size,
+                    live=bool(args.live),
+                )
+            except Exception as e:
+                S.post_in_flight = False
+                err_lower = str(e).lower()
+                is_crossing = "cross" in err_lower or "post only" in err_lower or "post_order rejected" in err_lower
+
+                # ── Bump crossing backoff so next attempt uses wider margin ──
+                if is_crossing:
+                    t_reject = now_ns()
+                    if req.side == "UP":
+                        cross_backoff_up = min(cross_backoff_up + 1, _MAX_CROSS_BACKOFF)
+                        cross_backoff_last_ns_up = t_reject
+                    else:
+                        cross_backoff_dn = min(cross_backoff_dn + 1, _MAX_CROSS_BACKOFF)
+                        cross_backoff_last_ns_dn = t_reject
+
+                jprint({
+                    "event": "post_error",
+                    "side": req.side,
+                    "trigger_kind": req.trigger_kind,
+                    "px": actual_px,
+                    "err": str(e),
+                    "is_crossing": is_crossing,
+                    "cross_backoff": cross_backoff_up if req.side == "UP" else cross_backoff_dn,
+                })
+                logger.emit_order_event(
+                    market_id=market_id, step_id=req.step_id,
+                    kind="post_error", side=req.side, order_id=None,
+                    px=actual_px, size=req.size,
+                    trigger_kind=req.trigger_kind, trigger_ns=req.trigger_ns,
+                    enqueue_ns=req.t_enqueue_ns, latency_ms=None, queue_ms=None,
+                    ok=False, payload={"err": str(e), "original_px": req.px,
+                                       "is_crossing": is_crossing},
+                )
+
+                if is_crossing:
+                    # Brief cooldown so Poly WS book data can catch up
+                    # before the next attempt; avoids hammering the API.
+                    await asyncio.sleep(0.15)
+
+                # Wake quote_manager to repost with fresh (backed-off) prices
+                requote_event.set()
+                continue
+
+            post_ms_list.append(ms)
+
+            S.order_id = oid
+            S.px = actual_px
+            S.post_ns = now_ns()
+            S.size_ordered = req.size
+            S.last_seen_matched = 0.0
+            S.post_in_flight = False
+
+            # ── Successful post → reset crossing backoff for this side ──
+            if req.side == "UP":
+                cross_backoff_up = 0
+            else:
+                cross_backoff_dn = 0
+
+            if req.trigger_kind in (
+                "BIN",
+                "FILL",
+                "REQUOTE",
+                "FILL_REPOST",
+                "RISK_CLEAR",
+                "STALE",
+                "PARTIAL",
+                "PARTIAL_REPOST",
+            ):
+                trigger_to_replace_ms_list.append(
+                    (now_ns() - req.trigger_ns) / 1e6
+                )
+
+            jprint({
+                "event": "post",
+                "side": req.side,
+                "px": actual_px,
+                "size": req.size,
+                "post_ms": ms,
+                "oid": oid,
+                "prio": "HI" if req.prio == 0 else "LO",
+                "trigger_kind": req.trigger_kind,
+                "resp": resp,
+                "trigger_to_replace_ms": (
+                    trigger_to_replace_ms_list[-1]
+                    if trigger_to_replace_ms_list
+                    else None
+                ),
+            })
+            logger.emit_order_event(
+                market_id=market_id, step_id=req.step_id,
+                kind="post_done", side=req.side, order_id=oid,
+                px=actual_px, size=req.size,
+                trigger_kind=req.trigger_kind, trigger_ns=req.trigger_ns,
+                enqueue_ns=req.t_enqueue_ns, latency_ms=ms, queue_ms=None,
+                ok=True, payload={"resp": resp, "original_px": req.px},
+            )
+
+    # ── Polymarket WebSocket (with reconnect) ────────────────────────────
+
+    async def poly_ws() -> None:
+        token_ids = [up_id, down_id]
+        while not shutdown.is_set():
+            try:
+                async with websockets.connect(
+                    POLY_WS,
+                    ssl=SSL_CTX,
+                    ping_interval=15,
+                    ping_timeout=20,
+                    max_queue=1,
+                    compression=None,
+                    close_timeout=3,
+                    open_timeout=10,
+                ) as ws:
+                    await ws.send(
+                        json.dumps({"type": "market", "assets_ids": token_ids})
+                    )
+                    jprint({"event": "poly_ws_subscribed", "slug": slug})
+                    async for raw in ws:
+                        if shutdown.is_set():
+                            return
+                        recv = now_ns()
+                        msg = _json_loads(raw)
+                        items = msg if isinstance(msg, list) else [msg]
+                        for d in items:
+                            if not isinstance(d, dict):
+                                continue
+                            if str(d.get("event_type", "")).lower() != "book":
+                                continue
+                            aid = str(d.get("asset_id", ""))
+                            bids = d.get("bids") or d.get("buys") or []
+                            asks = d.get("asks") or d.get("sells") or []
+                            bb = best_from_levels(bids, True)
+                            ba = best_from_levels(asks, False)
+                            if bb is None or ba is None:
+                                continue
+                            if aid == up_id:
+                                book_up.bid = float(bb)
+                                book_up.ask = float(ba)
+                                book_up.recv_ns = int(recv)
+                                logger.emit_tick(
+                                    market_id=market_id,
+                                    source="poly",
+                                    symbol="UP",
+                                    bid=float(bb),
+                                    ask=float(ba),
+                                    mid=0.5 * (float(bb) + float(ba)),
+                                    payload={"asset_id": aid},
+                                    sampler="poly",
+                                )
+                            elif aid == down_id:
+                                book_dn.bid = float(bb)
+                                book_dn.ask = float(ba)
+                                book_dn.recv_ns = int(recv)
+                                logger.emit_tick(
+                                    market_id=market_id,
+                                    source="poly",
+                                    symbol="DOWN",
+                                    bid=float(bb),
+                                    ask=float(ba),
+                                    mid=0.5 * (float(bb) + float(ba)),
+                                    payload={"asset_id": aid},
+                                    sampler="poly",
+                                )
+                        if poly_ok():
+                            poly_ready.set()
+                            # Best bid/ask changed → wake quote_manager so it
+                            # can reprice immediately instead of waiting for the
+                            # next quote_interval_ms timeout.
+                            requote_event.set()
+            except Exception as e:
+                jprint({"event": "poly_ws_error", "err": str(e)})
+                if not shutdown.is_set():
+                    await asyncio.sleep(1.0)
+
+    # ── Binance WebSocket (with reconnect across both URLs) ──────────────
+
+    async def bin_ws() -> None:
+        nonlocal bin_mid, bin_ref
+        nonlocal risk_active, risk_dir, risk_until_ns, last_risk_trigger_ns
+        nonlocal bin_history, last_fair_up, last_fair_dn
+        urls = [
+            f"{BINANCE_WS_PRIMARY}/{BINANCE_SYMBOL}@bookTicker",
+            f"{BINANCE_WS_FALLBACK}/{BINANCE_SYMBOL}@bookTicker",
+        ]
+        while not shutdown.is_set():
+            for url in urls:
+                if shutdown.is_set():
+                    return
+                try:
+                    async with websockets.connect(
+                        url,
+                        ssl=SSL_CTX,
+                        ping_interval=15,
+                        ping_timeout=20,
+                        max_queue=1,
+                        compression=None,
+                        close_timeout=3,
+                        open_timeout=10,
+                    ) as ws:
+                        jprint({"event": "bin_ws_connected", "url": url})
+                        async for raw in ws:
+                            if shutdown.is_set():
+                                return
+                            t = now_ns()
+                            d = _json_loads(raw)
+                            b = float(d["b"])
+                            a = float(d["a"])
+                            new_mid = 0.5 * (b + a)
+
+                            logger.emit_tick(
+                                market_id=market_id,
+                                source="binance",
+                                symbol=BINANCE_SYMBOL,
+                                bid=b,
+                                ask=a,
+                                mid=new_mid,
+                                payload={"raw_b": d.get("b"), "raw_a": d.get("a")},
+                                sampler="binance",
+                            )
+
+                            # Update volatility tracker on every tick
+                            vol_tracker.update(new_mid)
+
+                            bin_mid = new_mid
+                            
+                            # ── Update Binance price history for fair price model ──
+                            t = now_ns()
+                            bin_history.append((t, float(new_mid)))
+                            # Keep only recent history (last MAX_BIN_HISTORY entries)
+                            if len(bin_history) > MAX_BIN_HISTORY:
+                                bin_history.pop(0)
+                            
+                            if not bin_ready.is_set():
+                                bin_ready.set()
+
+                            if bin_ref is None:
+                                continue
+
+                            # ── Risk-timer clear (checked every tick) ────
+                            if (
+                                risk_active
+                                and risk_until_ns is not None
+                                and t >= risk_until_ns
+                            ):
+                                risk_active = False
+                                risk_dir = None
+                                risk_until_ns = None
+                                last_risk_trigger_ns = None
+                                bin_ref = float(bin_mid)
+                                jprint({
+                                    "event": "risk_clear_timer",
+                                    "t_ns": int(t),
+                                    "bin_ref": bin_ref,
+                                })
+                                # Trigger immediate requote
+                                requote_event.set()
+
+                            if risk_active:
+                                continue
+
+                            # ── Check for fair price change (trigger cancel/requote) ──
+                            if poly_ok() and len(bin_history) > 10:  # Need some history
+                                fair_prices = compute_fair_prices(t)
+                                if fair_prices is not None:
+                                    fair_up_new, fair_dn_new = fair_prices
+                                    tick = float(args.tick)
+                                    
+                                    # Check if fair price changed significantly (>= 1 tick)
+                                    fair_changed = False
+                                    if last_fair_up is not None:
+                                        if abs(fair_up_new - last_fair_up) >= tick - 1e-12:
+                                            fair_changed = True
+                                    if last_fair_dn is not None:
+                                        if abs(fair_dn_new - last_fair_dn) >= tick - 1e-12:
+                                            fair_changed = True
+                                    
+                                    if fair_changed or last_fair_up is None:
+                                        # Fair price changed → trigger requote
+                                        last_fair_up = fair_up_new
+                                        last_fair_dn = fair_dn_new
+                                        
+                                        jprint({
+                                            "event": "fair_price_change",
+                                            "fair_up": fair_up_new,
+                                            "fair_dn": fair_dn_new,
+                                            "bin_move": get_bin_move_usd(t),
+                                            "t_ns": int(t),
+                                        })
+                                        
+                                        # Trigger requote to update quotes based on new fair price
+                                        requote_event.set()
+                                    
+                                    # Update last fair prices even if no change (for first time)
+                                    if last_fair_up is None:
+                                        last_fair_up = fair_up_new
+                                        last_fair_dn = fair_dn_new
+
+                            # ── Also trigger on adverse Binance impulse even if fair doesn't tick ──
+                            # Because of 1c tick grid, fair may move < 1 tick but adverse selection
+                            # still becomes meaningful. We use a small USD trigger calibrated from DB.
+                            bm = get_bin_move_usd(t)
+                            if bm is not None:
+                                trig = float(getattr(args, "asel_trigger_usd", ASEL_TRIGGER_USD))
+                                if abs(float(bm)) >= trig:
+                                    requote_event.set()
+
+                            # ── Decay bin_ref toward current mid ─────────
+                            decay = float(args.bin_ref_decay)
+                            if 0.0 < decay < 1.0:
+                                bin_ref = (
+                                    bin_ref * (1.0 - decay) + bin_mid * decay
+                                )
+
+                            # ── Check for adverse BTC move ───────────────
+                            # CRITICAL FIX: cancel BOTH sides on any move
+                            # exceeding threshold, not just the adverse side.
+                            # DB analysis: fills after ΔB >= $2 are toxic on
+                            # the adverse side, but the "favorable" side is
+                            # also at risk because:
+                            #   (a) The move may reverse (whipsaw)
+                            #   (b) The non-cancelled side rests at a stale price
+                            #   (c) Pair completion at stale price + new price
+                            #       violates the 0.99 cost target
+                            move = float(bin_mid) - float(bin_ref)
+                            if abs(move) < float(args.bin_move_usd):
+                                continue
+
+                            risk_active = True
+                            last_risk_trigger_ns = int(t)
+                            risk_until_ns = int(
+                                t + int(float(args.risk_hold_ms) * 1e6)
+                            )
+                            risk_dir = "up" if move > 0 else "down"
+
+                            jprint({
+                                "event": "risk_trigger",
+                                "dir": risk_dir,
+                                "move_usd": move,
+                                "vol_ema": vol_tracker.ema,
+                                "t_ns": int(t),
+                            })
+
+                            risk_sid = log_step(
+                                "risk_trigger",
+                                action_id=0,
+                                action={"dir": risk_dir, "move_usd": move},
+                            )
+
+                            q = compute_pair_px()
+                            if q is None:
+                                # Reset ref so we don't re-trigger immediately
+                                bin_ref = float(bin_mid)
+                                continue
+                            base_up, base_dn = q
+
+                            # Cancel BOTH sides – not just adverse.
+                            # Replace prices already include the adverse-
+                            # selection guard from compute_pair_px().
+                            for cancel_S, cancel_name, cancel_repl in [
+                                (UP, "UP", risk_replace_px("UP", base_up, base_dn)),
+                                (DN, "DOWN", risk_replace_px("DOWN", base_up, base_dn)),
+                            ]:
+                                if cancel_S.order_id and not cancel_S.cancel_in_flight:
+                                    cancel_S.cancel_in_flight = True
+                                    old_oid = detach_order_for_audit(cancel_S)
+                                    enqueue_cancel(
+                                        prio=0,
+                                        trigger_kind="BIN",
+                                        side=cancel_name,
+                                        oid=str(old_oid),
+                                        trigger_ns=int(t),
+                                        replace_px=cancel_repl,
+                                        step_id=risk_sid,
+                                    )
+
+                            # Anchor ref to current mid after triggering
+                            bin_ref = float(bin_mid)
+
+                except Exception as e:
+                    jprint({
+                        "event": "bin_ws_error",
+                        "url": url,
+                        "err": str(e),
+                    })
+                    if not shutdown.is_set():
+                        await asyncio.sleep(1.0)
+
+    # ── Risk-timer watchdog ──────────────────────────────────────────────
+    # Independent timer that clears risk even if Binance WS goes quiet.
+
+    async def risk_timer_watchdog() -> None:
+        nonlocal risk_active, risk_dir, risk_until_ns
+        nonlocal last_risk_trigger_ns, bin_ref
+        while not shutdown.is_set():
+            await asyncio.sleep(0.010)  # 10 ms check interval
+            if not risk_active or risk_until_ns is None:
+                continue
+            if now_ns() >= risk_until_ns:
+                risk_active = False
+                risk_dir = None
+                risk_until_ns = None
+                last_risk_trigger_ns = None
+                if bin_mid is not None:
+                    bin_ref = float(bin_mid)
+                jprint({"event": "risk_clear_watchdog", "bin_ref": bin_ref})
+                requote_event.set()
+
+    # ── Fill detection (handles partial + full fills) ────────────────────
+
+    async def fill_watcher() -> None:
+        nonlocal inventory_up, inventory_dn, fills_up, fills_dn
+        while not shutdown.is_set():
+            await asyncio.sleep(float(args.fill_poll_ms) / 1000.0)
+
+            # ── 1. Audit cancelled orders for unaccounted partial fills ──
+            # When any code-path cancels an order (BIN, REQUOTE, STALE,
+            # ROLLOVER), it may not have polled get_order recently.  We do
+            # one final check here so those fills aren't lost.
+            audit_ids = list(pending_fill_audit.keys())
+            for oid in audit_ids:
+                side_name, prev_matched = pending_fill_audit[oid]
+                od = await get_order(loop, read_ex, client, oid)
+                final_matched = size_matched(od)
+                new_fill = final_matched - prev_matched
+                if new_fill > 1e-9:
+                    if side_name == "UP":
+                        inventory_up += new_fill
+                    else:
+                        inventory_dn += new_fill
+                    audit_sid = log_step(
+                        "audit_fill",
+                        action_id=-1,
+                        action={"oid": oid, "side": side_name, "credited": new_fill},
+                    )
+                    jprint({
+                        "event": "audit_fill",
+                        "side": side_name,
+                        "oid": oid,
+                        "prev_matched": prev_matched,
+                        "final_matched": final_matched,
+                        "credited": new_fill,
+                    })
+                    logger.emit_fill(
+                        market_id=market_id,
+                        step_id=audit_sid,
+                        fill_kind="audit_fill",
+                        side=side_name,
+                        order_id=str(oid),
+                        fill_qty=float(new_fill),
+                        total_matched=float(final_matched),
+                        remaining=0.0,
+                        px=None,
+                        inv_up=float(inventory_up),
+                        inv_dn=float(inventory_dn),
+                        payload={
+                            "bin_mid": bin_mid,
+                            "up_bid": book_up.bid, "up_ask": book_up.ask,
+                            "dn_bid": book_dn.bid, "dn_ask": book_dn.ask,
+                        },
+                    )
+                    # Inventory changed → signal requote so quotes adjust
+                    requote_event.set()
+                del pending_fill_audit[oid]
+
+            # ── 2. Check active orders for incremental fills ─────────────
+            for S, other, side_name, other_name in [
+                (UP, DN, "UP", "DOWN"),
+                (DN, UP, "DOWN", "UP"),
+            ]:
+                if not S.order_id:
+                    continue
+
+                od = await get_order(loop, read_ex, client, S.order_id)
+                current_matched = size_matched(od)
+                remaining = S.size_ordered - current_matched
+
+                # Log every order poll for RL training data
+                logger.emit_order_poll(
+                    market_id=market_id,
+                    step_id=current_step_id,
+                    side=side_name,
+                    order_id=str(S.order_id),
+                    px=float(S.px) if S.px is not None else None,
+                    size_ordered=float(S.size_ordered),
+                    size_matched=float(current_matched),
+                    remaining=float(remaining),
+                    payload={
+                        "raw": od,
+                        "bin_mid": bin_mid,
+                        "up_bid": book_up.bid, "up_ask": book_up.ask,
+                        "dn_bid": book_dn.bid, "dn_ask": book_dn.ask,
+                    },
+                )
+
+                new_fill = current_matched - S.last_seen_matched
+
+                if new_fill < 1e-9:
+                    continue  # no new fill since last check
+
+                # ── Credit the new fill increment to inventory ───────────
+                S.last_seen_matched = current_matched
+                if side_name == "UP":
+                    inventory_up += new_fill
+                else:
+                    inventory_dn += new_fill
+
+                is_full = remaining < float(args.min_remaining_size)
+
+                if is_full:
+                    # ── FULL FILL (or remainder too small to bother) ─────
+                    fill_sid = log_step(
+                        "fill",
+                        action_id=-1,
+                        action={"oid": S.order_id, "side": side_name, "new_fill": new_fill},
+                    )
+                    jprint({
+                        "event": "fill",
+                        "side": side_name,
+                        "oid": S.order_id,
+                        "matched": current_matched,
+                        "remaining": remaining,
+                        "type": "full",
+                        "inventory_up": inventory_up,
+                        "inventory_dn": inventory_dn,
+                    })
+                    logger.emit_fill(
+                        market_id=market_id,
+                        step_id=fill_sid,
+                        fill_kind="fill",
+                        side=side_name,
+                        order_id=str(S.order_id),
+                        fill_qty=float(new_fill),
+                        total_matched=float(current_matched),
+                        remaining=float(remaining),
+                        px=float(S.px) if S.px is not None else None,
+                        inv_up=float(inventory_up),
+                        inv_dn=float(inventory_dn),
+                        payload={
+                            "bin_mid": bin_mid,
+                            "up_bid": book_up.bid, "up_ask": book_up.ask,
+                            "dn_bid": book_dn.bid, "dn_ask": book_dn.ask,
+                        },
+                    )
+                    if side_name == "UP":
+                        fills_up += 1
+                    else:
+                        fills_dn += 1
+
+                    # Fills already credited above – just clear state
+                    clear_order_no_audit(S)
+
+                    # Default behavior is to KEEP the other side working so we
+                    # can complete the pair and keep inventory balanced.
+                    # Optional: cancel the other side if operator explicitly asks.
+                    if args.cancel_other_on_fill:
+                        if other.order_id and not other.cancel_in_flight:
+                            other.cancel_in_flight = True
+                            oid = detach_order_for_audit(other)
+                            if oid:
+                                enqueue_cancel(
+                                    prio=0,
+                                    trigger_kind="FILL",
+                                    side=other_name,
+                                    oid=str(oid),
+                                    trigger_ns=now_ns(),
+                                    replace_px=None,
+                                    step_id=fill_sid,
+                                )
+
+                    # Do NOT immediately repost the filled side aggressively.
+                    # Let quote_manager recompute both sides with inventory skew
+                    # and adverse-selection guard applied.
+                    requote_event.set()
+
+                else:
+                    # ── PARTIAL FILL ─────────────────────────────────────
+                    partial_sid = log_step(
+                        "partial_fill",
+                        action_id=-1,
+                        action={"oid": S.order_id, "side": side_name, "new_fill": new_fill},
+                    )
+                    jprint({
+                        "event": "partial_fill",
+                        "side": side_name,
+                        "oid": S.order_id,
+                        "new_fill": new_fill,
+                        "total_matched": current_matched,
+                        "remaining": remaining,
+                        "inventory_up": inventory_up,
+                        "inventory_dn": inventory_dn,
+                    })
+                    logger.emit_fill(
+                        market_id=market_id,
+                        step_id=partial_sid,
+                        fill_kind="partial_fill",
+                        side=side_name,
+                        order_id=str(S.order_id),
+                        fill_qty=float(new_fill),
+                        total_matched=float(current_matched),
+                        remaining=float(remaining),
+                        px=float(S.px) if S.px is not None else None,
+                        inv_up=float(inventory_up),
+                        inv_dn=float(inventory_dn),
+                        payload={
+                            "bin_mid": bin_mid,
+                            "up_bid": book_up.bid, "up_ask": book_up.ask,
+                            "dn_bid": book_dn.bid, "dn_ask": book_dn.ask,
+                        },
+                    )
+
+                    if args.partial_fill_reprice:
+                        # Cancel the remaining resting qty and re-post at an
+                        # inventory-skew-adjusted price with reduced size.
+                        S.cancel_in_flight = True
+                        old_oid = S.order_id
+                        # We've already credited all fills – no audit needed
+                        S.order_id = None
+                        S.px = None
+                        S.post_ns = None
+                        S.size_ordered = 0.0
+                        S.last_seen_matched = 0.0
+
+                        q = compute_pair_px()
+                        if q is not None:
+                            px_up, px_dn = q
+                            new_px = px_up if side_name == "UP" else px_dn
+                            enqueue_cancel(
+                                prio=0,
+                                trigger_kind="PARTIAL",
+                                side=side_name,
+                                oid=str(old_oid),
+                                trigger_ns=now_ns(),
+                                replace_px=float(new_px),
+                                replace_size=float(remaining),
+                                step_id=partial_sid,
+                            )
+                        else:
+                            # Can't compute price – cancel without replace,
+                            # quote_manager will re-post later.
+                            enqueue_cancel(
+                                prio=0,
+                                trigger_kind="PARTIAL",
+                                side=side_name,
+                                oid=str(old_oid),
+                                trigger_ns=now_ns(),
+                                replace_px=None,
+                                step_id=partial_sid,
+                            )
+                    else:
+                        # Leave the resting order alone; just signal requote
+                        # so the *other* side adjusts to our new inventory.
+                        requote_event.set()
+
+    # ── Quote manager ────────────────────────────────────────────────────
+
+    async def quote_manager() -> None:
+        nonlocal bin_ref
+        await bin_ready.wait()
+        await poly_ready.wait()
+
+        if bin_mid is not None:
+            bin_ref = float(bin_mid)
+
+        # Select initial action
+        apply_action(choose_action_id())
+
+        jprint({
+            "event": "quote_start",
+            "bin_ref": bin_ref,
+            "sum_target": args.sum_target,
+            "mid_offset_ticks": eff_mid_offset_ticks,
+            "ask_buffer_ticks": eff_ask_buffer_ticks,
+            "action_id": last_action_id,
+            "vol_ema": vol_tracker.ema,
+        })
+
+        last_tick_ns = 0
+
+        # Initial posts
+        init_sid = log_step(
+            "quote_manager_init",
+            action_id=last_action_id,
+            action={
+                "size": float(args.size),
+                "mode": "NORMAL",
+                **last_action_params,
+            },
+        )
+        q = compute_pair_px()
+        if q is not None:
+            px_up, px_dn = q
+            if _notional_ok(px_up, float(args.size)):
+                enqueue_post(
+                    prio=1,
+                    trigger_kind="INIT",
+                    side="UP",
+                    token_id=UP.token_id,
+                    px=px_up,
+                    trigger_ns=now_ns(),
+                    step_id=init_sid,
+                )
+            if _notional_ok(px_dn, float(args.size)):
+                enqueue_post(
+                    prio=1,
+                    trigger_kind="INIT",
+                    side="DOWN",
+                    token_id=DN.token_id,
+                    px=px_dn,
+                    trigger_ns=now_ns(),
+                    step_id=init_sid,
+                )
+
+        while not shutdown.is_set():
+            # Wait for either the periodic interval OR an immediate requote
+            # signal (from fill, risk-clear, cancel-without-replace, etc.)
+            try:
+                await asyncio.wait_for(
+                    requote_event.wait(),
+                    timeout=float(args.quote_interval_ms) / 1000.0,
+                )
+                requote_event.clear()
+            except asyncio.TimeoutError:
+                pass
+
+            t = now_ns()
+            if (t - last_tick_ns) < int(float(args.quote_min_gap_ms) * 1e6):
+                continue
+            last_tick_ns = t
+
+            # ── Refresh action for this cycle ─────────────────────────
+            apply_action(choose_action_id())
+
+            # Determine skip reason for step logging
+            skip_reason: Optional[str] = None
+            if risk_active:
+                skip_reason = "risk_active"
+            elif book_is_stale(float(args.stale_book_ms)):
+                skip_reason = "stale_book"
+
+            if risk_active:
+                # Log skip step before continuing
+                log_step(
+                    "quote_skip",
+                    action_id=last_action_id,
+                    action={"skip_reason": "risk_active", **last_action_params},
+                )
+                continue
+
+            # Stale data guard
+            if book_is_stale(float(args.stale_book_ms)):
+                log_step(
+                    "quote_skip",
+                    action_id=last_action_id,
+                    action={"skip_reason": "stale_book", **last_action_params},
+                )
+                continue
+
+            q = compute_pair_px()
+            if q is None:
+                log_step(
+                    "quote_skip",
+                    action_id=last_action_id,
+                    action={"skip_reason": "no_prices", **last_action_params},
+                )
+                continue
+            px_up, px_dn = q
+
+            # Enforce notional symmetry: if only one side can meet the $1
+            # minimum, we do NOT quote just that side from the main loop.
+            # One-sided posting is reserved for fill-driven rebalancing paths.
+            up_ok = _notional_ok(px_up, float(args.size))
+            dn_ok = _notional_ok(px_dn, float(args.size))
+            if not (up_ok and dn_ok):
+                # Symmetry rule: if we can't quote BOTH sides at >= $1 notional,
+                # we stand down on directional quoting from this loop.
+                # Any remaining resting orders on either side are cancelled
+                # without replacement so we don't sit only on the "expensive"
+                # side when the other is too cheap to quote.
+                for side_obj, name in [(UP, "UP"), (DN, "DOWN")]:
+                    if side_obj.order_id and not side_obj.cancel_in_flight:
+                        side_obj.cancel_in_flight = True
+                        oid = detach_order_for_audit(side_obj)
+                        enqueue_cancel(
+                            prio=1,
+                            trigger_kind="NOTIONAL",
+                            side=name,
+                            oid=str(oid),
+                            trigger_ns=now_ns(),
+                            replace_px=None,
+                            replace_size=None,
+                            step_id=None,
+                        )
+
+                log_step(
+                    "quote_skip",
+                    action_id=last_action_id,
+                    action={
+                        "skip_reason": "notional_mismatch",
+                        "desired_px_up": px_up,
+                        "desired_px_dn": px_dn,
+                        "up_ok": up_ok,
+                        "dn_ok": dn_ok,
+                        **last_action_params,
+                    },
+                )
+                continue
+
+            tick = float(args.tick)
+            max_age_ns = int(float(args.order_max_age_ms) * 1e6)
+
+            # ── Decision-point step ───────────────────────────────────
+            t_now = now_ns()
+            fair_prices = compute_fair_prices(t_now)
+            action_dict = {
+                "desired_px_up": px_up,
+                "desired_px_dn": px_dn,
+                "size": float(args.size),
+                "mode": "NORMAL",
+                "skip_reason": skip_reason,
+                **last_action_params,
+            }
+            if fair_prices is not None:
+                fair_up_val, fair_dn_val = fair_prices
+                action_dict["fair_up"] = fair_up_val
+                action_dict["fair_dn"] = fair_dn_val
+                action_dict["bin_move_usd"] = get_bin_move_usd(t_now)
+            
+            sid = log_step(
+                "quote_manager",
+                action_id=last_action_id,
+                action=action_dict,
+            )
+
+            for side, desired_px, name in [
+                (UP, px_up, "UP"),
+                (DN, px_dn, "DOWN"),
+            ]:
+                if side.cancel_in_flight:
+                    continue
+                if side.post_in_flight:
+                    continue
+
+                if side.order_id is None:
+                    # No resting order and no post queued → post
+                    enqueue_post(
+                        prio=1,
+                        trigger_kind="REQUOTE",
+                        side=name,
+                        token_id=side.token_id,
+                        px=desired_px,
+                        trigger_ns=now_ns(),
+                        step_id=sid,
+                    )
+                    continue
+
+                # Check if order needs repricing (price moved >= 1 tick)
+                needs_reprice = (
+                    side.px is not None
+                    and abs(float(side.px) - float(desired_px)) >= tick - 1e-12
+                )
+
+                # Check if order has been resting too long (adverse-selection
+                # risk increases with time; refreshing forces re-queue)
+                is_stale_order = (
+                    max_age_ns > 0
+                    and side.post_ns is not None
+                    and (t - side.post_ns) > max_age_ns
+                )
+
+                if needs_reprice or is_stale_order:
+                    side.cancel_in_flight = True
+                    oid = detach_order_for_audit(side)
+                    enqueue_cancel(
+                        prio=1,
+                        trigger_kind="STALE" if is_stale_order else "REQUOTE",
+                        side=name,
+                        oid=str(oid),
+                        trigger_ns=now_ns(),
+                        replace_px=float(desired_px),
+                        step_id=sid,
+                    )
+
+    # ── Rollover ─────────────────────────────────────────────────────────
+
+    async def roller() -> None:
+        while not shutdown.is_set():
+            await asyncio.sleep(0.25)
+            if datetime.now(ET) >= roll_et:
+                jprint({"event": "rollover", "at": roll_et.isoformat()})
+                roll_sid = log_step(
+                    "rollover",
+                    action_id=-1,
+                    action={"trigger": "hour_roll", "roll_et": roll_et.isoformat()},
+                )
+                # Cancel all outstanding orders before rolling
+                for S, name in [(UP, "UP"), (DN, "DOWN")]:
+                    if S.order_id and not S.cancel_in_flight:
+                        S.cancel_in_flight = True
+                        oid = detach_order_for_audit(S)
+                        if oid:
+                            enqueue_cancel(
+                                prio=0,
+                                trigger_kind="ROLLOVER",
+                                side=name,
+                                oid=str(oid),
+                                trigger_ns=now_ns(),
+                                replace_px=None,
+                                step_id=roll_sid,
+                            )
+                # Give cancels time to process before tearing down
+                await asyncio.sleep(0.5)
+                shutdown.set()
+                return
+
+    # ── Periodic stats ───────────────────────────────────────────────────
+
+    async def periodic() -> None:
+        while not shutdown.is_set():
+            await asyncio.sleep(float(args.summary_every_sec))
+            # Show spread breakdown so user can see exactly what's widening
+            up_skew_t, dn_skew_t = inventory_skew_ticks()
+            vol_extra_t = vol_spread_extra_ticks()
+            tick = float(args.tick)
+            secs_to_roll = (roll_et - datetime.now(ET)).total_seconds()
+            jprint({
+                "event": "rolling",
+                "post_ms": summarize(post_ms_list[-200:]),
+                "cancel_ms": summarize(cancel_ms_list[-200:]),
+                "cancel_queue_ms": summarize(cancel_queue_ms_list[-200:]),
+                "trigger_to_cancel_ms": summarize(
+                    trigger_to_cancel_ms_list[-200:]
+                ),
+                "trigger_to_replace_ms": summarize(
+                    trigger_to_replace_ms_list[-200:]
+                ),
+                "risk_active": risk_active,
+                "risk_dir": risk_dir,
+                "cross_backoff": {"UP": cross_backoff_up, "DN": cross_backoff_dn},
+                "spread_breakdown": {
+                    "mid_offset_ticks": float(eff_mid_offset_ticks),
+                    "ask_buffer_ticks": float(eff_ask_buffer_ticks),
+                    "vol_extra_ticks": round(vol_extra_t, 3),
+                    "up_skew_ticks": round(up_skew_t, 3),
+                    "dn_skew_ticks": round(dn_skew_t, 3),
+                    "total_offset_up": round(
+                        (eff_mid_offset_ticks + vol_extra_t + up_skew_t) * tick, 4
+                    ),
+                    "total_offset_dn": round(
+                        (eff_mid_offset_ticks + vol_extra_t + dn_skew_t) * tick, 4
+                    ),
+                },
+                "vol_ema": vol_tracker.ema,
+                "action_id": last_action_id,
+                "secs_to_roll": round(secs_to_roll, 1),
+                "UP_px": UP.px,
+                "DN_px": DN.px,
+                "inventory_up": inventory_up,
+                "inventory_dn": inventory_dn,
+                "fills_up": fills_up,
+                "fills_dn": fills_dn,
+                "UP_oid": UP.order_id is not None,
+                "DN_oid": DN.order_id is not None,
+                "db_dropped": logger.dropped_rows(),
+            })
+
+    # ── Launch all tasks ─────────────────────────────────────────────────
+
+    tasks = [
+        asyncio.create_task(cancel_worker(), name="cancel_1"),
+        asyncio.create_task(cancel_worker(), name="cancel_2"),
+        asyncio.create_task(post_worker(), name="post_1"),
+        asyncio.create_task(post_worker(), name="post_2"),
+        asyncio.create_task(poly_ws(), name="poly_ws"),
+        asyncio.create_task(bin_ws(), name="bin_ws"),
+        asyncio.create_task(risk_timer_watchdog(), name="risk_watchdog"),
+        asyncio.create_task(fill_watcher(), name="fill_watcher"),
+        asyncio.create_task(quote_manager(), name="quote_manager"),
+        asyncio.create_task(roller(), name="roller"),
+        asyncio.create_task(periodic(), name="periodic"),
+    ]
+
+    try:
+        await shutdown.wait()
+    finally:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        sign_ex.shutdown(wait=False, cancel_futures=True)
+        post_ex.shutdown(wait=False, cancel_futures=True)
+        cancel_ex.shutdown(wait=False, cancel_futures=True)
+        read_ex.shutdown(wait=False, cancel_futures=True)
+
+        final_state = {
+            "slug": slug,
+            "post_ms": summarize(post_ms_list),
+            "cancel_ms": summarize(cancel_ms_list),
+            "cancel_queue_ms": summarize(cancel_queue_ms_list),
+            "trigger_to_cancel_ms": summarize(trigger_to_cancel_ms_list),
+            "trigger_to_replace_ms": summarize(trigger_to_replace_ms_list),
+            "inventory_up": inventory_up,
+            "inventory_dn": inventory_dn,
+            "fills_up": fills_up,
+            "fills_dn": fills_dn,
+            "dropped_rows": logger.dropped_rows(),
+        }
+
+        jprint({"event": "summary", **final_state})
+
+        # Log market_end step for RL data slicing
+        log_step(
+            "market_end",
+            action_id=-1,
+            action={
+                "final_inventory_up": inventory_up,
+                "final_inventory_dn": inventory_dn,
+                "fills_up": fills_up,
+                "fills_dn": fills_dn,
+            },
+        )
+
+        logger.close()
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="HFT spread-capture market maker for Polymarket hourly BTC markets"
+    )
+    p.add_argument("--env-file", required=True)
+
+    p.add_argument("--walk-hours-forward", type=int, default=6)
+    p.add_argument("--gamma-timeout-sec", type=float, default=8.0)
+
+    p.add_argument("--live", action="store_true")
+    p.add_argument("--size", type=float, default=5.0)
+
+    p.add_argument("--tick", type=float, default=0.01)
+    p.add_argument("--price-min", type=float, default=0.01)
+    p.add_argument("--price-max", type=float, default=0.99)
+
+    p.add_argument("--sum-target", type=float, default=0.99,
+                   help="Target combined BUY cost for UP + DOWN pair. "
+                        "0.99 = $0.01 spread profit per completed pair.")
+    p.add_argument("--mid-offset-ticks", type=float, default=0.0,
+                   help="Ticks below the anchor (fair or ask ceiling) to quote. "
+                        "Acts as a fixed edge buffer.")
+    p.add_argument("--ask-buffer-ticks", type=float, default=1.0,
+                   help="Ticks below best ask for the maker ceiling. "
+                        "DB analysis: fills at ask-1 have +0.5c markout; at ask "
+                        "they're 0. Default 1 tick ensures we never cross the ask.")
+
+    p.add_argument("--bin-move-usd", type=float, default=2.0,
+                   help="Binance move threshold ($) to trigger cancel-both-sides. "
+                        "DB analysis: adverse selection begins at ~$2 over 250ms.")
+    p.add_argument("--risk-extra-ticks", type=int, default=1,
+                   help="Extra ticks to pull back on replacement after risk trigger")
+    p.add_argument("--risk-hold-ms", type=float, default=250.0)
+
+    # Adverse-selection guard
+    p.add_argument(
+        "--asel-trigger-usd",
+        type=float,
+        default=2.0,
+        help="Minimum |ΔB(250ms)| in $ to activate adverse-selection guard. "
+             "Pulls quotes back on the adverse side by 1-3 extra ticks based on "
+             "ΔB magnitude. DB analysis: fills become toxic above ~$2.",
+    )
+
+    # Volatility-adaptive spread
+    p.add_argument(
+        "--vol-half-life",
+        type=int,
+        default=50,
+        help="EMA half-life in Binance ticks for volatility tracker",
+    )
+    p.add_argument(
+        "--vol-spread-scale",
+        type=float,
+        default=0.5,
+        help="Extra offset ticks per unit of vol multiplier above 1.0. "
+             "DB analysis: fills during volatile periods need wider spread. "
+             "Set to 0 to disable (not recommended).",
+    )
+    p.add_argument(
+        "--vol-spread-max-ticks",
+        type=float,
+        default=1.0,
+        help="Hard cap on vol-adaptive spread widening in ticks (prevents blowout)",
+    )
+
+    # Inventory skew
+    p.add_argument(
+        "--inventory-skew-ticks",
+        type=float,
+        default=0.02,
+        help="Ticks to skew per unit of inventory imbalance (positive = less "
+             "aggressive on overweight side). DB analysis: max imbalance was ~36 "
+             "units; at 0.02, that's 0.72 ticks of skew — meaningful but not "
+             "punitive. Set higher (0.05-0.15) to be more aggressive on rebalancing.",
+    )
+    p.add_argument(
+        "--cancel-other-on-fill",
+        action="store_true",
+        default=False,
+        help="Cancel the other side's order when one side fills (default: False; keep both to complete pairs)",
+    )
+    p.add_argument(
+        "--no-cancel-other-on-fill",
+        dest="cancel_other_on_fill",
+        action="store_false",
+        help="Keep the other side's order alive after a fill (pure spread capture)",
+    )
+
+    # Partial fill behaviour
+    p.add_argument(
+        "--partial-fill-reprice",
+        action="store_true",
+        default=True,
+        help="On partial fill: cancel remaining, reprice at inventory-skewed level with reduced size (default: True)",
+    )
+    p.add_argument(
+        "--no-partial-fill-reprice",
+        dest="partial_fill_reprice",
+        action="store_false",
+        help="On partial fill: leave resting order alone, only update inventory & signal requote for other side",
+    )
+    p.add_argument(
+        "--min-remaining-size",
+        type=float,
+        default=0.5,
+        help="Remaining order size below this is treated as a full fill (default: 0.5)",
+    )
+
+    # Stale data / order guards
+    p.add_argument(
+        "--stale-book-ms",
+        type=float,
+        default=5000.0,
+        help="Max age of Poly book data before suppressing quotes",
+    )
+    p.add_argument(
+        "--order-max-age-ms",
+        type=float,
+        default=30000.0,
+        help="Max age of a resting order before auto-refresh (0 = disabled)",
+    )
+
+    # Reference price decay
+    p.add_argument(
+        "--bin-ref-decay",
+        type=float,
+        default=0.0,
+        help="Per-tick decay of bin_ref toward current mid (0 = off, 1 = instant). "
+             "Disabled by default: bin_ref decay masks trending moves, causing the "
+             "$2 risk trigger to never fire during slow trends. The fair price model "
+             "handles continuous adjustment instead.",
+    )
+
+    p.add_argument("--quote-interval-ms", type=float, default=15.0)
+    p.add_argument("--quote-min-gap-ms", type=float, default=8.0)
+    p.add_argument("--fill-poll-ms", type=float, default=150.0)
+    p.add_argument("--summary-every-sec", type=float, default=10.0)
+
+    p.add_argument(
+        "--max-runtime-sec",
+        type=float,
+        default=0.0,
+        help="0 = forever across hours (rolls internally each hour)",
+    )
+
+    # ── RL data logging (SQLite) ─────────────────────────────────────────
+    p.add_argument(
+        "--db-path",
+        type=str,
+        default="mm_rl_log.sqlite",
+        help="SQLite database path for RL training data",
+    )
+    p.add_argument(
+        "--db-max-queue",
+        type=int,
+        default=200_000,
+        help="Max pending rows before dropping (default: 200000)",
+    )
+    p.add_argument(
+        "--db-flush-ms",
+        type=int,
+        default=250,
+        help="Flush interval for the DB writer thread (default: 250ms)",
+    )
+    p.add_argument(
+        "--db-log-binance-every-ms",
+        type=int,
+        default=25,
+        help="Min interval between logged Binance ticks (default: 25ms)",
+    )
+    p.add_argument(
+        "--db-log-poly-every-ms",
+        type=int,
+        default=25,
+        help="Min interval between logged Poly ticks (default: 25ms)",
+    )
+
+    # ── RL policy action override ────────────────────────────────────────
+    p.add_argument(
+        "--policy-action-id",
+        type=int,
+        default=-1,
+        help="Force a specific action menu index (-1 = use CLI knobs, default: -1)",
+    )
+
+    return p.parse_args()
+
+
+async def main_async(args: argparse.Namespace) -> None:
+    load_env_file(args.env_file)
+
+    t0 = time.perf_counter()
+    while True:
+        slug, mk, hour_start_et = resolve_market_with_hour(
+            args.walk_hours_forward, args.gamma_timeout_sec
+        )
+        up_id, down_id = extract_up_down_token_ids(mk)
+        await run_one_market(
+            args,
+            slug=slug,
+            up_id=up_id,
+            down_id=down_id,
+            hour_start_et=hour_start_et,
+        )
+
+        if float(args.max_runtime_sec) > 0 and (
+            time.perf_counter() - t0
+        ) >= float(args.max_runtime_sec):
+            return
+
+        # Brief pause before resolving next hour market
+        await asyncio.sleep(0.5)
+
+
+def main() -> None:
+    args = parse_args()
+    asyncio.run(main_async(args))
+
+
+if __name__ == "__main__":
+    main()
