@@ -37,6 +37,16 @@ import websockets
 
 from logger_v2 import SQLiteEventLogger, epoch_ns, iso_utc_from_epoch_ns
 
+# #region agent log
+_DBG_LOG = r"c:\Users\antho\OneDrive\Desktop\5minute\.cursor\debug.log"
+def _dbg(msg, data, hyp=""):
+    try:
+        with open(_DBG_LOG, "a") as _f:
+            _f.write(json.dumps({"timestamp":int(time.time()*1000),"location":"market_maker_v2.py","message":msg,"data":data,"hypothesisId":hyp})+"\n")
+    except Exception:
+        pass
+# #endregion
+
 # ── Fast JSON if available ───────────────────────────────────────────────────
 try:
     import orjson as _orjson
@@ -601,6 +611,7 @@ async def run_one_market(
     
     # ── MODEL-FREE impulse horizon ─────────────────────────────────────────
     IMPULSE_MS = float(args.impulse_ms)
+    IMPULSE_MEDIUM_MS = IMPULSE_MS * 10  # medium horizon for sustained moves
 
     # ── Adverse-selection guard (data-driven) ──────────────────────────────
     ASEL_TRIGGER_USD = 2.0  # default; can be overridden by CLI
@@ -862,6 +873,10 @@ async def run_one_market(
     # MODEL-FREE soft holds: per-side pause after adverse-side cancel
     soft_hold_until_ns: dict[str, int] = {"UP": 0, "DOWN": 0}
 
+    # Cancel backoff: suppress cancel retries after transient 425 errors
+    _CANCEL_BACKOFF_NS = int(100e6)  # 100 ms
+    cancel_backoff_until_ns: dict[str, int] = {"UP": 0, "DOWN": 0}
+
     roll_et = hour_start_et + timedelta(hours=1)
 
     # ── Pricing helpers ──────────────────────────────────────────────────
@@ -932,28 +947,48 @@ async def run_one_market(
             return None
         return float(bin_mid) - b_lag
 
-    def adverse_selection_extra_ticks(side_name: str, bin_move_usd: float) -> int:
-        """Extra ticks to pull back on the adverse side, based on |ΔB|.
+    def get_bin_move_usd_medium(t_ns: int) -> Optional[float]:
+        """Model-free impulse over IMPULSE_MEDIUM_MS (sustained-move horizon)."""
+        if bin_mid is None:
+            return None
+        b_lag = _bin_at_lag(t_ns, int(IMPULSE_MEDIUM_MS * 1e6))
+        if b_lag is None:
+            return None
+        return float(bin_mid) - b_lag
 
-        Data from the backup log shows mean 250ms markout turns negative for:
-        - UP fills when ΔB_250ms is negative with magnitude >= ~$2-$5
-        - DOWN fills when ΔB_250ms is positive with magnitude >= ~$2-$5
+    def get_worst_impulse(t_ns: int) -> Optional[float]:
+        """Return the impulse with the largest absolute magnitude across
+        short (IMPULSE_MS) and medium (IMPULSE_MEDIUM_MS) horizons.
+        Sign is preserved so the caller can determine direction."""
+        bm_s = get_bin_move_usd(t_ns)
+        bm_m = get_bin_move_usd_medium(t_ns)
+        if bm_s is None and bm_m is None:
+            return None
+        if bm_s is None:
+            return bm_m
+        if bm_m is None:
+            return bm_s
+        return bm_s if abs(bm_s) >= abs(bm_m) else bm_m
+
+    def adverse_selection_extra_ticks(side_name: str, bin_move_usd: float) -> float:
+        """Continuous proportional pullback starting at soft_move_usd.
+
+        For each unit of soft_move_usd of adverse impulse, pull back
+        0.5 ticks, capped at 3.0 ticks.  This replaces the old coarse
+        bucket system so that moves between $0.10-$2 are also covered.
         """
+        soft = float(args.soft_move_usd)
+        if soft <= 0:
+            return 0.0
         # Determine adverse magnitude for this side
         if side_name == "UP":
             adv = max(0.0, -float(bin_move_usd))
         else:
             adv = max(0.0, float(bin_move_usd))
 
-        b0, b1, b2 = ASEL_BUCKETS_USD
-        t0, t1, t2 = ASEL_EXTRA_TICKS
-        if adv >= b2:
-            return int(t2)
-        if adv >= b1:
-            return int(t1)
-        if adv >= b0:
-            return int(t0)
-        return 0
+        if adv < soft:
+            return 0.0
+        return min(3.0, (adv / soft) * 0.5)
     
     def compute_fair_prices(t_ns: int) -> Optional[tuple[float, float]]:
         # MODEL-FREE MODE: disable learned fair pricing entirely.
@@ -997,18 +1032,19 @@ async def run_one_market(
         px_dn_base = dn_ceil - ask_buf - base_off
 
         # ── Adverse-selection guard: pull back adverse side by extra ticks ──
+        # Use the worst (largest-magnitude) impulse across both short and
+        # medium horizons so sustained moves are also captured.
+        # Proportional pullback starts at soft_move_usd (no dead zone).
         t_now = now_ns()
-        bin_move = get_bin_move_usd(t_now)
-        extra_up = 0
-        extra_dn = 0
+        bin_move = get_worst_impulse(t_now)
+        extra_up = 0.0
+        extra_dn = 0.0
         if bin_move is not None:
-            trig = float(getattr(args, "asel_trigger_usd", ASEL_TRIGGER_USD))
-            if abs(float(bin_move)) >= trig:
-                extra_up = adverse_selection_extra_ticks("UP", float(bin_move))
-                extra_dn = adverse_selection_extra_ticks("DOWN", float(bin_move))
+            extra_up = adverse_selection_extra_ticks("UP", float(bin_move))
+            extra_dn = adverse_selection_extra_ticks("DOWN", float(bin_move))
 
-        px_up_base -= float(extra_up) * tick
-        px_dn_base -= float(extra_dn) * tick
+        px_up_base -= extra_up * tick
+        px_dn_base -= extra_dn * tick
         
         px_up = px_up_base - vol_extra - up_skew_t * tick
         px_dn = px_dn_base - vol_extra - dn_skew_t * tick
@@ -1307,11 +1343,12 @@ async def run_one_market(
                     },
                 )
             except Exception as e:
+                _err_str = str(e)
                 jprint({
                     "event": "cancel_error",
                     "side": req.side,
                     "oid": req.order_id,
-                    "err": str(e),
+                    "err": _err_str,
                 })
                 logger.emit_order_event(
                     market_id=market_id,
@@ -1327,8 +1364,19 @@ async def run_one_market(
                     latency_ms=None,
                     queue_ms=q_ms,
                     ok=False,
-                    payload={"err": str(e)},
+                    payload={"err": _err_str},
                 )
+
+                # ── Transient 425 backoff: suppress cancel retries ────
+                _is_transient = "425" in _err_str or "service not ready" in _err_str.lower()
+                if _is_transient:
+                    cancel_backoff_until_ns[req.side] = now_ns() + _CANCEL_BACKOFF_NS
+                    jprint({
+                        "event": "cancel_backoff_425",
+                        "side": req.side,
+                        "oid": req.order_id,
+                        "backoff_ms": _CANCEL_BACKOFF_NS / 1e6,
+                    })
 
             if not cancel_ok:
                 # Cancel may not have gone through — old order could still be
@@ -1565,10 +1613,10 @@ async def run_one_market(
 
             # ── JIT Binance impulse guard: skip posts into fresh moves ─
             # This is the last line of defence before sending the order.
-            # If the current Binance impulse over IMPULSE_MS is adverse
-            # for this side and exceeds soft_move_usd, we skip the post,
-            # extend the soft hold, and wake quote_manager to retry later.
-            bm_now = get_bin_move_usd(now_ns())
+            # Check BOTH short and medium horizons — if EITHER is adverse
+            # and exceeds soft_move_usd, skip the post, extend the soft
+            # hold, and wake quote_manager to retry later.
+            bm_now = get_worst_impulse(now_ns())
             if bm_now is not None:
                 soft_thr = float(args.soft_move_usd)
                 adverse = False
@@ -1578,6 +1626,10 @@ async def run_one_market(
                 else:
                     # BTC up (positive move) hurts DOWN bids
                     adverse = bm_now >= soft_thr
+
+                # #region agent log
+                _dbg("jit_guard", {"side":req.side,"bm_now":bm_now,"soft_thr":soft_thr,"adverse":adverse,"trigger_kind":req.trigger_kind,"actual_px":actual_px}, "H1")
+                # #endregion
 
                 if adverse:
                     hold_ns = int(float(args.soft_hold_ms) * 1e6)
@@ -1727,6 +1779,10 @@ async def run_one_market(
             S.size_ordered = req.size
             S.last_seen_matched = 0.0
             S.post_in_flight = False
+
+            # #region agent log
+            _dbg("post_sent", {"side":req.side,"px":actual_px,"trigger_kind":req.trigger_kind,"bm_at_post":get_bin_move_usd(now_ns()),"size":req.size}, "H1")
+            # #endregion
 
             # ── Successful post: only reset crossing backoff if we posted
             # at/near the ORIGINAL desired price (not a backed-off fallback).
@@ -1930,7 +1986,9 @@ async def run_one_market(
                                 bin_ready.set()
 
                             # ── MODEL-FREE: latency-aware adverse-side cancel ──
-                            bm = get_bin_move_usd(t)  # impulse over --impulse-ms
+                            # Check BOTH short and medium impulse horizons.
+                            # Trigger if EITHER exceeds the soft threshold.
+                            bm = get_worst_impulse(t)
                             if (not risk_active) and bm is not None:
                                 soft = float(args.soft_move_usd)
                                 hold_ns = int(float(args.soft_hold_ms) * 1e6)
@@ -1939,7 +1997,8 @@ async def run_one_market(
                                 if bm <= -soft:
                                     if soft_hold_until_ns["UP"] < now_ns() + hold_ns:
                                         soft_hold_until_ns["UP"] = now_ns() + hold_ns
-                                    if UP.order_id and not UP.cancel_in_flight:
+                                    if (UP.order_id and not UP.cancel_in_flight
+                                            and now_ns() >= cancel_backoff_until_ns["UP"]):
                                         UP.cancel_in_flight = True
                                         oid = detach_order_for_audit(UP)
                                         if oid:
@@ -1958,7 +2017,8 @@ async def run_one_market(
                                 elif bm >= soft:
                                     if soft_hold_until_ns["DOWN"] < now_ns() + hold_ns:
                                         soft_hold_until_ns["DOWN"] = now_ns() + hold_ns
-                                    if DN.order_id and not DN.cancel_in_flight:
+                                    if (DN.order_id and not DN.cancel_in_flight
+                                            and now_ns() >= cancel_backoff_until_ns["DOWN"]):
                                         DN.cancel_in_flight = True
                                         oid = detach_order_for_audit(DN)
                                         if oid:
@@ -1999,12 +2059,14 @@ async def run_one_market(
                                 continue
 
                             # ── Adverse-selection requote trigger ────────
-                            # If impulse exceeds asel threshold, wake quote_manager
-                            # so compute_pair_px adds extra ticks on the adverse side.
-                            bm = get_bin_move_usd(t)
+                            # If impulse (worst across both horizons) exceeds
+                            # asel threshold, wake quote_manager so
+                            # compute_pair_px adds extra ticks on the adverse side.
+                            bm = get_worst_impulse(t)
                             if bm is not None:
-                                trig = float(getattr(args, "asel_trigger_usd", ASEL_TRIGGER_USD))
-                                if abs(float(bm)) >= trig:
+                                # Use soft_move_usd as the trigger since the
+                                # proportional pullback now starts there.
+                                if abs(float(bm)) >= float(args.soft_move_usd):
                                     requote_event.set()
 
                             # ── Decay bin_ref toward current mid ─────────
@@ -2015,7 +2077,7 @@ async def run_one_market(
                                 )
 
                             # ── HARD risk trigger: impulse-based ─────────
-                            bm_hard = get_bin_move_usd(t)
+                            bm_hard = get_worst_impulse(t)
                             if bm_hard is None:
                                 continue
 
@@ -2058,7 +2120,8 @@ async def run_one_market(
                                 (UP, "UP", risk_replace_px("UP", base_up, base_dn)),
                                 (DN, "DOWN", risk_replace_px("DOWN", base_up, base_dn)),
                             ]:
-                                if cancel_S.order_id and not cancel_S.cancel_in_flight:
+                                if (cancel_S.order_id and not cancel_S.cancel_in_flight
+                                        and now_ns() >= cancel_backoff_until_ns[cancel_name]):
                                     cancel_S.cancel_in_flight = True
                                     old_oid = detach_order_for_audit(cancel_S)
                                     enqueue_cancel(
@@ -2313,28 +2376,46 @@ async def run_one_market(
                     if args.partial_fill_reprice:
                         # Cancel the remaining resting qty and re-post at an
                         # inventory-skew-adjusted price with reduced size.
-                        # Use detach_order_for_audit so any fills between now
-                        # and the cancel completing are tracked & reconciled.
-                        S.cancel_in_flight = True
-                        old_oid = detach_order_for_audit(S)
+                        # But SKIP if the new price is within 1 tick of the
+                        # old price — no point destroying queue position for
+                        # the same price.
+                        _partial_old_px = float(S.px) if S.px is not None else None
+                        tick = float(args.tick)
 
                         q = compute_pair_px()
                         if q is not None:
                             px_up, px_dn = q
                             new_px = px_up if side_name == "UP" else px_dn
-                            enqueue_cancel(
-                                prio=0,
-                                trigger_kind="PARTIAL",
-                                side=side_name,
-                                oid=str(old_oid),
-                                trigger_ns=now_ns(),
-                                replace_px=float(new_px),
-                                replace_size=float(remaining),
-                                step_id=partial_sid,
-                            )
+                            _partial_delta = abs(float(new_px) - _partial_old_px) if _partial_old_px is not None else None
+
+                            # #region agent log
+                            _dbg("partial_reprice", {"side":side_name,"old_px":_partial_old_px,"new_px":float(new_px),"delta_ticks":round(_partial_delta / tick, 2) if _partial_delta is not None else None,"remaining":float(remaining),"skipped":(_partial_delta is not None and _partial_delta < tick - 1e-12)}, "H2")
+                            # #endregion
+
+                            if _partial_delta is not None and _partial_delta < tick - 1e-12:
+                                # Price unchanged (< 1 tick) — skip cancel+replace,
+                                # preserve queue position.  Signal requote so the
+                                # other side adjusts to the new inventory.
+                                requote_event.set()
+                            else:
+                                # Price changed meaningfully — cancel+replace.
+                                S.cancel_in_flight = True
+                                old_oid = detach_order_for_audit(S)
+                                enqueue_cancel(
+                                    prio=0,
+                                    trigger_kind="PARTIAL",
+                                    side=side_name,
+                                    oid=str(old_oid),
+                                    trigger_ns=now_ns(),
+                                    replace_px=float(new_px),
+                                    replace_size=float(remaining),
+                                    step_id=partial_sid,
+                                )
                         else:
                             # Can't compute price – cancel without replace,
                             # quote_manager will re-post later.
+                            S.cancel_in_flight = True
+                            old_oid = detach_order_for_audit(S)
                             enqueue_cancel(
                                 prio=0,
                                 trigger_kind="PARTIAL",
@@ -2588,6 +2669,11 @@ async def run_one_market(
                 (UP, px_up, "UP"),
                 (DN, px_dn, "DOWN"),
             ]:
+                # ── 425 cancel backoff: skip ALL cancel/reprice actions
+                # for this side while we're in the transient-error cooldown.
+                if now_ns() < cancel_backoff_until_ns[name]:
+                    continue
+
                 # MODEL-FREE soft hold: do not repost into the adverse impulse window
                 if now_ns() < int(soft_hold_until_ns[name]):
                     # If an order is somehow still live, cancel it.
@@ -2643,6 +2729,23 @@ async def run_one_market(
                 )
 
                 if needs_reprice:
+                    # ── Block upward repricing during Binance moves ──
+                    # Moving a bid HIGHER during a market move means paying
+                    # more and losing queue position.  Only allow upward
+                    # repricing when the market is calm.  Downward repricing
+                    # (pulling back) is always allowed — that's defensive.
+                    is_upward = float(desired_px) > float(side.px) + 1e-12  # type: ignore[arg-type]
+                    if is_upward:
+                        bm_worst = get_worst_impulse(now_ns())
+                        if bm_worst is not None and abs(bm_worst) >= float(args.soft_move_usd):
+                            # #region agent log
+                            _dbg("qm_reprice_blocked_upward", {"side":name,"old_px":float(side.px) if side.px is not None else None,"desired_px":float(desired_px),"bm_worst":bm_worst}, "H3")
+                            # #endregion
+                            continue  # don't chase market up during moves
+
+                    # #region agent log
+                    _dbg("qm_reprice", {"side":name,"old_px":float(side.px) if side.px is not None else None,"desired_px":float(desired_px),"delta_ticks":round(abs(float(side.px)-float(desired_px))/tick,2) if side.px is not None else None,"signal_driven":signal_driven,"bm":get_bin_move_usd(now_ns()),"is_upward":is_upward}, "H3")
+                    # #endregion
                     side.cancel_in_flight = True
                     oid = detach_order_for_audit(side)
                     enqueue_cancel(
